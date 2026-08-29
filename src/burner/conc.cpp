@@ -112,6 +112,8 @@ static ConcEncoding conc_detect_encoding(const UINT8* buf, size_t len)
 	return conc_is_valid_utf8(buf, len) ? CONC_ENC_UTF8 : CONC_ENC_ANSI;
 }
 
+// Read entire file into a malloc'd TCHAR buffer (UTF-8→TCHAR on non-Win32;
+// UTF-8→UTF-16 wchar_t on Win32 _UNICODE).  Caller must free().
 static TCHAR* conc_load_text(const TCHAR* pszFileName)
 {
 	FILE* fp = _tfopen(pszFileName, _T("rb"));

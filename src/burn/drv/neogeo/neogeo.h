@@ -184,12 +184,3 @@ UINT8 uPD4990ARead();
 
 // d_neogeo.cpp
 void kf2k3pcb_bios_decode();
-
-// RomData extra ROM mapping (neo_run.cpp)
-#ifdef __cplusplus
-extern "C" {
-#endif
-void NeoProcessExtraRom(UINT8* rom);
-#ifdef __cplusplus
-}
-#endif

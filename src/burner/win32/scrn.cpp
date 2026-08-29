@@ -1248,7 +1248,7 @@ static INT32 RomdataGetDrvIndex(const TCHAR* pszDrvName)
 	return -1;
 }
 
-int BurnerLoadDriver(TCHAR *pszDriverName)
+INT32 BurnerLoadDriver(TCHAR *pszDriverName)
 {
 	INT32 nDrvIdx = RomdataGetDrvIndex(pszDriverName);
 	if (nDrvIdx < 0)

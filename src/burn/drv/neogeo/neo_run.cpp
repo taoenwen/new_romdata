@@ -3905,6 +3905,34 @@ static void SwitchToMusashi()
 }
 #endif
 
+static void NeoProcessExtraRom(UINT8* rom)
+{
+	if (!IsRomDataDrv())
+		return;
+
+	const char* pszExtName = RomDataDrvGetExtName();
+	if (!pszExtName || !pszExtName[0])
+		return;
+
+	UINT32 nRomCount = 0;
+	struct BurnRomInfo* pRomInfo = RomDataDrvGetRomInfo(&nRomCount);
+	if (!pRomInfo)
+		return;
+
+	UINT32 romLen = 0, exromLen = 0;
+	for (UINT32 i = 0; i < nRomCount; i++) {
+		const struct BurnRomInfo* pRom = &pRomInfo[i];
+		if (pRom->szName && 0 == strcmp(pRom->szName, pszExtName))
+			exromLen = pRom->nLen;
+		if (1 == (pRom->nType & 7))						// Neo Geo P-ROMs
+			romLen += pRom->nLen;
+	}
+	if (0 == exromLen || romLen <= exromLen)
+		return;
+
+	SekMapMemory(rom + (romLen - exromLen), 0x900000, 0x900000 + (exromLen - 1), MAP_ROM);
+}
+
 static INT32 NeoInitCommon()
 {
 	BurnSetRefreshRate((nNeoSystemType & NEO_SYS_CD) ? NEO_CDVREFRESH : NEO_VREFRESH);
@@ -5156,28 +5184,4 @@ INT32 NeoFrame()
 	}
 
 	return 0;
-}
-
-extern "C" void NeoProcessExtraRom(UINT8* rom)
-{
-	if (!IsRomDataDrv()) return;
-
-	const char* pszExtName = RomDataDrvGetExtName();
-	if (!pszExtName || !pszExtName[0]) return;
-
-	UINT32 nRomCount = 0;
-	struct BurnRomInfo* pRI = RomDataDrvGetRomInfo(&nRomCount);
-	if (!pRI) return;
-
-	UINT32 romLen = 0, exromLen = 0;
-	for (UINT32 i = 0; i < nRomCount; i++) {
-		const struct BurnRomInfo* ri = &pRI[i];
-		if (ri->szName && 0 == strcmp(ri->szName, pszExtName))
-			exromLen = ri->nLen;
-		if (1 == (ri->nType & 7))						// Neo Geo P-ROMs
-			romLen += ri->nLen;
-	}
-	if (0 == exromLen || romLen <= exromLen) return;
-
-	SekMapMemory(rom + (romLen - exromLen), 0x900000, 0x900000 + (exromLen - 1), MAP_ROM);
 }
