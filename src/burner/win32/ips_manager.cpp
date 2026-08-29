@@ -6,43 +6,92 @@
 //  convert to TCHAR text in-memory.  No CRT ccs mode, no in-place disk rewriting.
 //  --------------------------------------------------------------------------
 
-enum { IPS_ENC_ANSI, IPS_ENC_UTF8, IPS_ENC_UTF8_BOM, IPS_ENC_UTF16_LE, IPS_ENC_UTF16_BE };
+enum IpsEncoding {
+	IPS_ENC_ANSI = 0,
+	IPS_ENC_UTF8,
+	IPS_ENC_UTF8_BOM,
+	IPS_ENC_UTF16_LE,
+	IPS_ENC_UTF16_BE,
+	IPS_ENC_UTF16_LE_NOBOM,
+};
 
-static bool ips_is_valid_utf8(const unsigned char* buf, size_t len)
+static bool ips_is_valid_utf8(const UINT8* buf, size_t len)
 {
 	size_t p = 0;
 	while (p < len) {
-		unsigned char c = buf[p];
-		if (c < 0x80) { p++; continue; }
-		int nExtra;
-		if      (c >= 0xC2 && c <= 0xDF) nExtra = 1;
-		else if (c >= 0xE0 && c <= 0xEF) nExtra = 2;
-		else if (c >= 0xF0 && c <= 0xF4) nExtra = 3;
-		else return false;
-		for (int i = 1; i <= nExtra; i++) {
-			if (p + (size_t)i >= len) return false;
-			if (0x80 != (buf[p + i] & 0xC0)) return false;
+		UINT8 c = buf[p];
+		if (c == 0x00)
+			return false;
+		if (c < 0x80) {
+			p++;
+			continue;
+		}
+
+		INT32 nExtra;
+		if (c >= 0xc2 && c <= 0xdf)
+			nExtra = 1;
+		else if (c >= 0xe0 && c <= 0xef)
+			nExtra = 2;
+		else if (c >= 0xf0 && c <= 0xf4)
+			nExtra = 3;
+		else
+			return false;
+
+		for (INT32 i = 1; i <= nExtra; i++) {
+			if (p + (size_t)i >= len || (buf[p + i] & 0xc0) != 0x80)
+				return false;
 		}
 		p += nExtra + 1;
 	}
 	return true;
 }
 
-static int ips_detect_encoding(const unsigned char* buf, size_t len)
+static UINT8* ips_read_all(FILE* fp, size_t* pLen)
 {
-	if (len >= 3 && buf[0] == 0xEF && buf[1] == 0xBB && buf[2] == 0xBF)	return IPS_ENC_UTF8_BOM;
-	if (len >= 2 && buf[0] == 0xFF && buf[1] == 0xFE)					return IPS_ENC_UTF16_LE;
-	if (len >= 2 && buf[0] == 0xFE && buf[1] == 0xFF)					return IPS_ENC_UTF16_BE;
-	if (len == 0)														return IPS_ENC_ANSI;
-	size_t scan = len < 4096 ? len : 4096;
-	size_t zeroEven = 0, zeroOdd = 0;
-	for (size_t i = 0; i < scan; i++) {
-		if (buf[i] == 0x00) { if (i & 1) zeroOdd++; else zeroEven++; }
+	if (!fp || !pLen)
+		return NULL;
+
+	*pLen = 0;
+	if (_fseeki64(fp, 0, SEEK_END) != 0)
+		return NULL;
+
+	INT64 nSize = _ftelli64(fp);
+	if (nSize < 0 || (UINT64)nSize > (UINT64)SIZE_MAX - 1 || _fseeki64(fp, 0, SEEK_SET) != 0)
+		return NULL;
+
+	UINT8* buf = (UINT8*)malloc((size_t)nSize + 1);
+	if (!buf)
+		return NULL;
+
+	size_t got = fread(buf, 1, (size_t)nSize, fp);
+	if (got != (size_t)nSize || ferror(fp)) {
+		free(buf);
+		return NULL;
 	}
-	if ((zeroEven + zeroOdd) * 4 >= scan) {
-		if (zeroOdd  > zeroEven * 4) return IPS_ENC_UTF16_LE;
-		if (zeroEven > zeroOdd  * 4) return IPS_ENC_UTF16_BE;
-	}
+	buf[got] = 0;
+	*pLen = got;
+	return buf;
+}
+
+static bool ips_is_utf16le_nobom(const UINT8* buf, size_t len)
+{
+	if (!buf || len < 2 || (len & 1) || buf[0] == 0 || buf[1] != 0)
+		return false;
+
+	INT32 nFlags = IS_TEXT_UNICODE_STATISTICS;
+	return IsTextUnicode(buf, (INT32)(len > INT_MAX ? INT_MAX : len), &nFlags) != 0;
+}
+
+static IpsEncoding ips_detect_encoding(const UINT8* buf, size_t len)
+{
+	if (len >= 2 && buf[0] == 0xfe && buf[1] == 0xff)
+		return IPS_ENC_UTF16_BE;
+	if (len >= 2 && buf[0] == 0xff && buf[1] == 0xfe)
+		return IPS_ENC_UTF16_LE;
+	if (len >= 3 && buf[0] == 0xef && buf[1] == 0xbb && buf[2] == 0xbf)
+		return IPS_ENC_UTF8_BOM;
+	if (ips_is_utf16le_nobom(buf, len))
+		return IPS_ENC_UTF16_LE_NOBOM;
 	return ips_is_valid_utf8(buf, len) ? IPS_ENC_UTF8 : IPS_ENC_ANSI;
 }
 
@@ -51,82 +100,127 @@ static int ips_detect_encoding(const unsigned char* buf, size_t len)
 static TCHAR* ips_load_text(const TCHAR* pszFileName)
 {
 	FILE* fp = _tfopen(pszFileName, _T("rb"));
-	if (!fp) return NULL;
-	if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return NULL; }
-	long sz = ftell(fp);
-	if (sz < 0) { fclose(fp); return NULL; }
-	rewind(fp);
-	unsigned char* raw = (unsigned char*)malloc((size_t)sz + 1);
-	if (!raw) { fclose(fp); return NULL; }
-	size_t got = fread(raw, 1, (size_t)sz, fp);
-	raw[got] = 0;
-	fclose(fp);
+	if (!fp)
+		return NULL;
 
-	int enc = ips_detect_encoding(raw, got);
+	size_t len = 0;
+	UINT8* raw = ips_read_all(fp, &len);
+	fclose(fp);
+	if (!raw)
+		return NULL;
+
+	IpsEncoding enc = ips_detect_encoding(raw, len);
+	if (enc == IPS_ENC_ANSI) {
+		if (len > INT_MAX) {
+			free(raw);
+			return NULL;
+		}
+		INT32 wn = MultiByteToWideChar(CP_ACP, 0, (char*)raw, (INT32)len, NULL, 0);
+		if (wn <= 0) {
+			free(raw);
+			return NULL;
+		}
+		wchar_t* w = (wchar_t*)malloc((size_t)(wn + 1) * sizeof(wchar_t));
+		if (!w) {
+			free(raw);
+			return NULL;
+		}
+		MultiByteToWideChar(CP_ACP, 0, (char*)raw, (INT32)len, w, wn);
+		w[wn] = 0;
+		free(raw);
+		return (TCHAR*)w;
+	}
 
 	char* u8;
-	if (enc == IPS_ENC_UTF8 || enc == IPS_ENC_ANSI) {
-		if (enc == IPS_ENC_ANSI) {
-			INT32 wn = MultiByteToWideChar(CP_ACP, 0, (char*)raw, (INT32)got, NULL, 0);
-			if (wn > 0) {
-				wchar_t* w = (wchar_t*)malloc((size_t)(wn + 1) * sizeof(wchar_t));
-				if (w) {
-					MultiByteToWideChar(CP_ACP, 0, (char*)raw, (INT32)got, w, wn);
-					w[wn] = 0;
-					free(raw);
-					return (TCHAR*)w;
-				}
-			}
-		}
+	if (enc == IPS_ENC_UTF8) {
 		u8 = (char*)raw;
 	} else if (enc == IPS_ENC_UTF8_BOM) {
-		memmove(raw, raw + 3, got - 3 + 1);
+		memmove(raw, raw + 3, len - 3 + 1);
 		u8 = (char*)raw;
 	} else {
-		size_t start = 2;
-		size_t units = (got - start) / 2;
+		size_t start = (enc == IPS_ENC_UTF16_LE_NOBOM) ? 0 : 2;
+		if (len < start || ((len - start) & 1)) {
+			free(raw);
+			return NULL;
+		}
+		size_t units = (len - start) / 2;
+		if (units > (SIZE_MAX - 1) / 3) {
+			free(raw);
+			return NULL;
+		}
 		u8 = (char*)malloc(units * 3 + 1);
-		if (!u8) { free(raw); return NULL; }
+		if (!u8) {
+			free(raw);
+			return NULL;
+		}
+
 		size_t o = 0;
 		for (size_t i = 0; i < units; i++) {
-			unsigned int cp;
-			unsigned char b0 = raw[start + i*2 + 0];
-			unsigned char b1 = raw[start + i*2 + 1];
-			cp = (enc == IPS_ENC_UTF16_LE) ? (unsigned int)(b0 | (b1 << 8))
-			                              : (unsigned int)(b1 | (b0 << 8));
+			UINT8 b0 = raw[start + i * 2 + 0];
+			UINT8 b1 = raw[start + i * 2 + 1];
+			UINT32 cp = (enc == IPS_ENC_UTF16_BE) ? (UINT32)(b1 | (b0 << 8)) : (UINT32)(b0 | (b1 << 8));
+			if (cp >= 0xd800 && cp < 0xdc00) {
+				if (++i >= units) {
+					free(u8);
+					free(raw);
+					return NULL;
+				}
+				b0 = raw[start + i * 2 + 0];
+				b1 = raw[start + i * 2 + 1];
+				UINT32 low = (enc == IPS_ENC_UTF16_BE) ? (UINT32)(b1 | (b0 << 8)) : (UINT32)(b0 | (b1 << 8));
+				if (low < 0xdc00 || low >= 0xe000) {
+					free(u8);
+					free(raw);
+					return NULL;
+				}
+				cp = 0x10000 + ((cp & 0x3ff) << 10) + (low & 0x3ff);
+			} else if (cp >= 0xdc00 && cp < 0xe000) {
+				free(u8);
+				free(raw);
+				return NULL;
+			}
+
 			if (cp < 0x80) {
 				u8[o++] = (char)cp;
 			} else if (cp < 0x800) {
-				u8[o++] = (char)(0xC0 | (cp >> 6));
-				u8[o++] = (char)(0x80 | (cp & 0x3F));
+				u8[o++] = (char)(0xc0 | (cp >> 6));
+				u8[o++] = (char)(0x80 | (cp & 0x3f));
+			} else if (cp < 0x10000) {
+				u8[o++] = (char)(0xe0 | (cp >> 12));
+				u8[o++] = (char)(0x80 | ((cp >> 6) & 0x3f));
+				u8[o++] = (char)(0x80 | (cp & 0x3f));
 			} else {
-				u8[o++] = (char)(0xE0 | (cp >> 12));
-				u8[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
-				u8[o++] = (char)(0x80 | (cp & 0x3F));
+				u8[o++] = (char)(0xf0 | (cp >> 18));
+				u8[o++] = (char)(0x80 | ((cp >> 12) & 0x3f));
+				u8[o++] = (char)(0x80 | ((cp >> 6) & 0x3f));
+				u8[o++] = (char)(0x80 | (cp & 0x3f));
 			}
 		}
 		u8[o] = 0;
 		free(raw);
 	}
 
-#ifdef _UNICODE
 	INT32 wn = MultiByteToWideChar(CP_UTF8, 0, u8, -1, NULL, 0);
-	if (wn <= 0) { free(u8); return NULL; }
+	if (wn <= 0) {
+		free(u8);
+		return NULL;
+	}
 	wchar_t* w = (wchar_t*)malloc((size_t)wn * sizeof(wchar_t));
-	if (!w) { free(u8); return NULL; }
+	if (!w) {
+		free(u8);
+		return NULL;
+	}
 	MultiByteToWideChar(CP_UTF8, 0, u8, -1, w, wn);
 	free(u8);
 	return (TCHAR*)w;
-#else
-	return (TCHAR*)u8;
-#endif
 }
 
 // In-memory _fgetts replacement
 static TCHAR* ips_gets(TCHAR* szLine, INT32 nMaxLen, const TCHAR* pText, TCHAR** ppSave)
 {
 	TCHAR* p = *ppSave ? *ppSave : (TCHAR*)pText;
-	if (!p || *p == _T('\0')) return NULL;
+	if (!p || *p == _T('\0'))
+		return NULL;
 	INT32 i = 0;
 	while (i < nMaxLen - 1 && *p && *p != _T('\n')) {
 		szLine[i++] = *p++;
@@ -145,17 +239,24 @@ static TCHAR* ips_qtoken(TCHAR* s, const TCHAR* delims)
 	static TCHAR* prev_str = NULL;
 	TCHAR* token = NULL;
 	if (!s) {
-		if (!prev_str) return NULL;
+		if (!prev_str)
+			return NULL;
 		s = prev_str;
 	}
 	s += _tcsspn(s, delims);
-	if (s[0] == _T('\0')) { prev_str = NULL; return NULL; }
+	if (s[0] == _T('\0')) {
+		prev_str = NULL;
+		return NULL;
+	}
 	if (s[0] == _T('"')) {
 		token = ++s;
 		if ((s = _tcspbrk(token, _T("\"")))) {
 			*(s++) = _T('\0');
 		}
-		if (!s) { prev_str = NULL; return NULL; }
+		if (!s) {
+			prev_str = NULL;
+			return NULL;
+		}
 	} else {
 		token = s;
 	}
@@ -505,8 +606,10 @@ INT32 LoadIpsActivePatches()
 				nLen--;
 			}
 
-			if (!_tcsnicmp(szLine, _T("//"), 2)) continue;
-			if (!_tcsicmp(szLine, _T("")))       continue;
+			if (!_tcsnicmp(szLine, _T("//"), 2))
+				continue;
+			if (!_tcsicmp(szLine, _T("")))
+				continue;
 
 			_stprintf(szIpsActivePatches[nActivePatches], _T("%s%s\\%s"), szAppIpsPath, szDriverName, szLine);
 			nActivePatches++;
@@ -746,7 +849,7 @@ static INT_PTR CALLBACK DefInpProc(HWND hDlg, UINT Msg, WPARAM wParam, LPARAM lP
 		case WM_INITDIALOG: {
 			hIpsDlg = hDlg;
 
-			hWhiteBGBrush = CreateSolidBrush(RGB(0xFF,0xFF,0xFF));
+			hWhiteBGBrush = CreateSolidBrush(RGB(0xff, 0xff, 0xff));
 			hPreview = PNGLoadBitmap(hIpsDlg, NULL, 304, 228, 2);
 			SendDlgItemMessage(hIpsDlg, IDC_SCREENSHOT_H, STM_SETIMAGE, IMAGE_BITMAP, (LPARAM)hPreview);
 
@@ -1370,7 +1473,8 @@ static UINT32 GetIpsDefineExpValue(TCHAR* pszTmp)
 	else if (0 == _tcscmp(pszTmp, _T("EXP_VALUE_600"))) nRet = 0x6000000;
 	else if (0 == _tcscmp(pszTmp, _T("EXP_VALUE_700"))) nRet = 0x7000000;
 	else if (0 == _tcscmp(pszTmp, _T("EXP_VALUE_800"))) nRet = 0x8000000;
-	else if (EOF != (_stscanf(pszTmp, _T("%x"), &nRet))) return nRet;
+	else if (EOF != (_stscanf(pszTmp, _T("%x"), &nRet)))
+		return nRet;
 
 	return nRet;
 }
