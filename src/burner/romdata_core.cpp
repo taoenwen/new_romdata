@@ -445,9 +445,13 @@ static bool rd_hex(const char* s, UINT32* out)
 	errno = 0;
 	char* end = NULL;
 	unsigned long v = strtoul(s, &end, 16);
-	// strtoul is 64-bit wide on LP64, so range-check explicitly instead of truncating.
-	if (s == end || *end != '\0' || errno == ERANGE || (UINT64)v > 0xffffffffULL)
+	if (s == end || *end != '\0' || errno == ERANGE)
 		return false;
+#if ULONG_MAX > 0xffffffffUL
+	// strtoul is wider than UINT32 on LP64, so reject values that would truncate.
+	if (v > 0xffffffffUL)
+		return false;
+#endif
 
 	*out = (UINT32)v;
 	return true;
