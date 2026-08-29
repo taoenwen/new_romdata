@@ -5,107 +5,216 @@
 //  New-style text loading: read entire file into memory, auto-detect encoding,
 //  convert to TCHAR text in-memory (no CRT ccs mode, no in-place disk rewriting).
 
-enum { CONC_ENC_ANSI, CONC_ENC_UTF8, CONC_ENC_UTF8_BOM, CONC_ENC_UTF16_LE, CONC_ENC_UTF16_BE };
+enum ConcEncoding {
+	CONC_ENC_ANSI = 0,
+	CONC_ENC_UTF8,
+	CONC_ENC_UTF8_BOM,
+	CONC_ENC_UTF16_LE,
+	CONC_ENC_UTF16_BE,
+	CONC_ENC_UTF16_LE_NOBOM,
+};
 
-static bool conc_is_valid_utf8(const unsigned char* buf, size_t len)
+static bool conc_is_valid_utf8(const UINT8* buf, size_t len)
 {
 	size_t p = 0;
 	while (p < len) {
-		unsigned char c = buf[p];
-		if (c < 0x80) { p++; continue; }
-		int nExtra;
-		if      (c >= 0xC2 && c <= 0xDF) nExtra = 1;
-		else if (c >= 0xE0 && c <= 0xEF) nExtra = 2;
-		else if (c >= 0xF0 && c <= 0xF4) nExtra = 3;
-		else return false;
-		for (int i = 1; i <= nExtra; i++) {
-			if (p + (size_t)i >= len) return false;
-			if (0x80 != (buf[p + i] & 0xC0)) return false;
+		UINT8 c = buf[p];
+		if (c == 0x00)
+			return false;
+		if (c < 0x80) {
+			p++;
+			continue;
+		}
+
+		INT32 nExtra;
+		if (c >= 0xc2 && c <= 0xdf)
+			nExtra = 1;
+		else if (c >= 0xe0 && c <= 0xef)
+			nExtra = 2;
+		else if (c >= 0xf0 && c <= 0xf4)
+			nExtra = 3;
+		else
+			return false;
+
+		for (INT32 i = 1; i <= nExtra; i++) {
+			if (p + (size_t)i >= len || (buf[p + i] & 0xc0) != 0x80)
+				return false;
 		}
 		p += nExtra + 1;
 	}
 	return true;
 }
 
-static int conc_detect_encoding(const unsigned char* buf, size_t len)
+static UINT8* conc_read_all(FILE* fp, size_t* pLen)
 {
-	if (len >= 3 && buf[0] == 0xEF && buf[1] == 0xBB && buf[2] == 0xBF)	return CONC_ENC_UTF8_BOM;
-	if (len >= 2 && buf[0] == 0xFF && buf[1] == 0xFE)					return CONC_ENC_UTF16_LE;
-	if (len >= 2 && buf[0] == 0xFE && buf[1] == 0xFF)					return CONC_ENC_UTF16_BE;
-	if (len == 0)														return CONC_ENC_ANSI;
-	size_t scan = len < 4096 ? len : 4096;
-	size_t zeroEven = 0, zeroOdd = 0;
-	for (size_t i = 0; i < scan; i++) {
-		if (buf[i] == 0x00) { if (i & 1) zeroOdd++; else zeroEven++; }
+	if (!fp || !pLen)
+		return NULL;
+
+	*pLen = 0;
+#ifdef BUILD_WIN32
+	if (_fseeki64(fp, 0, SEEK_END) != 0)
+		return NULL;
+
+	INT64 nSize = _ftelli64(fp);
+	if (nSize < 0 || (UINT64)nSize > (UINT64)SIZE_MAX - 1 || _fseeki64(fp, 0, SEEK_SET) != 0)
+		return NULL;
+#else
+	if (fseeko(fp, 0, SEEK_END) != 0)
+		return NULL;
+
+	INT64 nSize = (INT64)ftello(fp);
+	if (nSize < 0 || (UINT64)nSize > (UINT64)SIZE_MAX - 1 || fseeko(fp, 0, SEEK_SET) != 0)
+		return NULL;
+#endif
+	UINT8* buf = (UINT8*)malloc((size_t)nSize + 1);
+	if (!buf)
+		return NULL;
+
+	size_t got = fread(buf, 1, (size_t)nSize, fp);
+	if (got != (size_t)nSize || ferror(fp)) {
+		free(buf);
+		return NULL;
 	}
-	if ((zeroEven + zeroOdd) * 4 >= scan) {
-		if (zeroOdd  > zeroEven * 4) return CONC_ENC_UTF16_LE;
-		if (zeroEven > zeroOdd  * 4) return CONC_ENC_UTF16_BE;
+	buf[got] = 0;
+	*pLen = got;
+	return buf;
+}
+
+static bool conc_is_utf16le_nobom(const UINT8* buf, size_t len)
+{
+	if (!buf || len < 2 || (len & 1) || buf[0] == 0 || buf[1] != 0)
+		return false;
+
+#ifdef BUILD_WIN32
+	INT32 nFlags = IS_TEXT_UNICODE_STATISTICS;
+	return IsTextUnicode(buf, (INT32)(len > INT_MAX ? INT_MAX : len), &nFlags) != 0;
+#else
+	size_t units = len / 2;
+	size_t zeroHigh = 0;
+	for (size_t i = 0; i < units; i++) {
+		if (buf[i * 2 + 1] == 0)
+			zeroHigh++;
 	}
+	return zeroHigh * 4 >= units * 3;
+#endif
+}
+
+static ConcEncoding conc_detect_encoding(const UINT8* buf, size_t len)
+{
+	if (len >= 2 && buf[0] == 0xfe && buf[1] == 0xff)
+		return CONC_ENC_UTF16_BE;
+	if (len >= 2 && buf[0] == 0xff && buf[1] == 0xfe)
+		return CONC_ENC_UTF16_LE;
+	if (len >= 3 && buf[0] == 0xef && buf[1] == 0xbb && buf[2] == 0xbf)
+		return CONC_ENC_UTF8_BOM;
+	if (conc_is_utf16le_nobom(buf, len))
+		return CONC_ENC_UTF16_LE_NOBOM;
 	return conc_is_valid_utf8(buf, len) ? CONC_ENC_UTF8 : CONC_ENC_ANSI;
 }
 
-// Read entire file into a malloc'd TCHAR buffer (UTF-8→TCHAR on non-Win32;
-// UTF-8→UTF-16 wchar_t on Win32 _UNICODE).  Caller must free().
 static TCHAR* conc_load_text(const TCHAR* pszFileName)
 {
 	FILE* fp = _tfopen(pszFileName, _T("rb"));
-	if (!fp) return NULL;
-	if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return NULL; }
-	long sz = ftell(fp);
-	if (sz < 0) { fclose(fp); return NULL; }
-	rewind(fp);
-	unsigned char* raw = (unsigned char*)malloc((size_t)sz + 1);
-	if (!raw) { fclose(fp); return NULL; }
-	size_t got = fread(raw, 1, (size_t)sz, fp);
-	raw[got] = 0;
+	if (!fp)
+		return NULL;
+
+	size_t len = 0;
+	UINT8* raw = conc_read_all(fp, &len);
 	fclose(fp);
+	if (!raw)
+		return NULL;
 
-	int enc = conc_detect_encoding(raw, got);
+	ConcEncoding enc = conc_detect_encoding(raw, len);
 
-	// Step 1: decode raw bytes to UTF-8 (malloc'd, caller-freed path returns this later on non-Win32)
-	char* u8;
-	if (enc == CONC_ENC_UTF8 || enc == CONC_ENC_ANSI) {
-#ifdef BUILD_WIN32
-		if (enc == CONC_ENC_ANSI) {
-			INT32 wn = MultiByteToWideChar(CP_ACP, 0, (char*)raw, (INT32)got, NULL, 0);
-			if (wn > 0) {
-				wchar_t* w = (wchar_t*)malloc((size_t)(wn + 1) * sizeof(wchar_t));
-				if (w) {
-					MultiByteToWideChar(CP_ACP, 0, (char*)raw, (INT32)got, w, wn);
-					w[wn] = 0;
-					free(raw);
-					return (TCHAR*)w;
-				}
-			}
+#if defined(BUILD_WIN32) && defined(_UNICODE)
+	if (enc == CONC_ENC_ANSI) {
+		if (len > INT_MAX) {
+			free(raw);
+			return NULL;
 		}
+		INT32 wn = MultiByteToWideChar(CP_ACP, 0, (char*)raw, (INT32)len, NULL, 0);
+		if (wn <= 0) {
+			free(raw);
+			return NULL;
+		}
+		wchar_t* w = (wchar_t*)malloc((size_t)(wn + 1) * sizeof(wchar_t));
+		if (!w) {
+			free(raw);
+			return NULL;
+		}
+		MultiByteToWideChar(CP_ACP, 0, (char*)raw, (INT32)len, w, wn);
+		w[wn] = 0;
+		free(raw);
+		return (TCHAR*)w;
+	}
+#else
+	if (enc == CONC_ENC_ANSI)
+		return (TCHAR*)raw;
 #endif
+
+	char* u8;
+	if (enc == CONC_ENC_UTF8) {
 		u8 = (char*)raw;
 	} else if (enc == CONC_ENC_UTF8_BOM) {
-		memmove(raw, raw + 3, got - 3 + 1);
+		memmove(raw, raw + 3, len - 3 + 1);
 		u8 = (char*)raw;
 	} else {
-		// UTF-16 LE/BE → UTF-8
-		size_t start = 2;
-		size_t units = (got - start) / 2;
+		size_t start = (enc == CONC_ENC_UTF16_LE_NOBOM) ? 0 : 2;
+		if (len < start || ((len - start) & 1)) {
+			free(raw);
+			return NULL;
+		}
+		size_t units = (len - start) / 2;
+		if (units > (SIZE_MAX - 1) / 3) {
+			free(raw);
+			return NULL;
+		}
 		u8 = (char*)malloc(units * 3 + 1);
-		if (!u8) { free(raw); return NULL; }
+		if (!u8) {
+			free(raw);
+			return NULL;
+		}
+
 		size_t o = 0;
 		for (size_t i = 0; i < units; i++) {
-			unsigned int cp;
-			unsigned char b0 = raw[start + i*2 + 0];
-			unsigned char b1 = raw[start + i*2 + 1];
-			cp = (enc == CONC_ENC_UTF16_LE) ? (unsigned int)(b0 | (b1 << 8))
-			                               : (unsigned int)(b1 | (b0 << 8));
+			UINT8 b0 = raw[start + i * 2 + 0];
+			UINT8 b1 = raw[start + i * 2 + 1];
+			UINT32 cp = (enc == CONC_ENC_UTF16_BE) ? (UINT32)(b1 | (b0 << 8)) : (UINT32)(b0 | (b1 << 8));
+			if (cp >= 0xd800 && cp < 0xdc00) {
+				if (++i >= units) {
+					free(u8);
+					free(raw);
+					return NULL;
+				}
+				b0 = raw[start + i * 2 + 0];
+				b1 = raw[start + i * 2 + 1];
+				UINT32 low = (enc == CONC_ENC_UTF16_BE) ? (UINT32)(b1 | (b0 << 8)) : (UINT32)(b0 | (b1 << 8));
+				if (low < 0xdc00 || low >= 0xe000) {
+					free(u8);
+					free(raw);
+					return NULL;
+				}
+				cp = 0x10000 + ((cp & 0x3ff) << 10) + (low & 0x3ff);
+			} else if (cp >= 0xdc00 && cp < 0xe000) {
+				free(u8);
+				free(raw);
+				return NULL;
+			}
+
 			if (cp < 0x80) {
 				u8[o++] = (char)cp;
 			} else if (cp < 0x800) {
-				u8[o++] = (char)(0xC0 | (cp >> 6));
-				u8[o++] = (char)(0x80 | (cp & 0x3F));
+				u8[o++] = (char)(0xc0 | (cp >> 6));
+				u8[o++] = (char)(0x80 | (cp & 0x3f));
+			} else if (cp < 0x10000) {
+				u8[o++] = (char)(0xe0 | (cp >> 12));
+				u8[o++] = (char)(0x80 | ((cp >> 6) & 0x3f));
+				u8[o++] = (char)(0x80 | (cp & 0x3f));
 			} else {
-				u8[o++] = (char)(0xE0 | (cp >> 12));
-				u8[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
-				u8[o++] = (char)(0x80 | (cp & 0x3F));
+				u8[o++] = (char)(0xf0 | (cp >> 18));
+				u8[o++] = (char)(0x80 | ((cp >> 12) & 0x3f));
+				u8[o++] = (char)(0x80 | ((cp >> 6) & 0x3f));
+				u8[o++] = (char)(0x80 | (cp & 0x3f));
 			}
 		}
 		u8[o] = 0;
@@ -113,11 +222,16 @@ static TCHAR* conc_load_text(const TCHAR* pszFileName)
 	}
 
 #ifdef _UNICODE
-	// Win32 TCHAR = wchar_t (UTF-16): convert UTF-8 to wchar_t
 	INT32 wn = MultiByteToWideChar(CP_UTF8, 0, u8, -1, NULL, 0);
-	if (wn <= 0) { free(u8); return NULL; }
+	if (wn <= 0) {
+		free(u8);
+		return NULL;
+	}
 	wchar_t* w = (wchar_t*)malloc((size_t)wn * sizeof(wchar_t));
-	if (!w) { free(u8); return NULL; }
+	if (!w) {
+		free(u8);
+		return NULL;
+	}
 	MultiByteToWideChar(CP_UTF8, 0, u8, -1, w, wn);
 	free(u8);
 	return (TCHAR*)w;
@@ -132,7 +246,8 @@ static TCHAR* conc_load_text(const TCHAR* pszFileName)
 static TCHAR* conc_gets(TCHAR* szLine, INT32 nMaxLen, const TCHAR* pText, TCHAR** ppSave)
 {
 	TCHAR* p = *ppSave ? *ppSave : (TCHAR*)pText;
-	if (!p || *p == _T('\0')) return NULL;
+	if (!p || *p == _T('\0'))
+		return NULL;
 	INT32 i = 0;
 	while (i < nMaxLen - 1 && *p && *p != _T('\n')) {
 		szLine[i++] = *p++;
@@ -212,14 +327,14 @@ static TCHAR* getFilenameFromPath(TCHAR* path) {
 		return NULL;
 	}
 
-    TCHAR* filename = path;
+	TCHAR* filename = path;
 
-    for (TCHAR* p = path; *p != '\0'; p++) {
-        if (*p == '/' || *p == '\\') {
-            filename = p + 1;
-        }
-    }
-    return filename;
+	for (TCHAR* p = path; *p != '\0'; p++) {
+		if (*p == '/' || *p == '\\') {
+			filename = p + 1;
+		}
+	}
+	return filename;
 }
 
 static void CheatLinkNewNode(TCHAR *szDerp)
@@ -249,7 +364,7 @@ static void CheatLinkNewNode(TCHAR *szDerp)
 
 static INT32 ConfigParseFile(TCHAR* pszFilename)
 {
-#define INSIDE_NOTHING (0xFFFF & (1 << ((sizeof(TCHAR) * 8) - 1)))
+#define INSIDE_NOTHING (0xffff & (1 << ((sizeof(TCHAR) * 8) - 1)))
 
 	TCHAR szLine[8192];
 	TCHAR* s;
@@ -284,7 +399,7 @@ static INT32 ConfigParseFile(TCHAR* pszFilename)
 		nLen = _tcslen(szLine);
 
 		// Get rid of the linefeed at the end
-		while ((nLen > 0) && (szLine[nLen - 1] == 0x0A || szLine[nLen - 1] == 0x0D)) {
+		while ((nLen > 0) && (szLine[nLen - 1] == 0x0a || szLine[nLen - 1] == 0x0d)) {
 			szLine[nLen - 1] = 0;
 			nLen--;
 		}
@@ -546,12 +661,13 @@ static INT32 ConfigParseNebulaFile(TCHAR* pszFilename)
 	{
 		nLen = _tcslen(szLine);
 
-		while ((nLen > 0) && (szLine[nLen - 1] == 0x0A || szLine[nLen - 1] == 0x0D)) {
+		while ((nLen > 0) && (szLine[nLen - 1] == 0x0a || szLine[nLen - 1] == 0x0d)) {
 			szLine[nLen - 1] = 0;
 			nLen--;
 		}
 
-		if (nLen < 3 || szLine[0] == '[') continue;
+		if (nLen < 3 || szLine[0] == '[')
+			continue;
 
 		if (!_tcsncmp (_T("Name="), szLine, 5))
 		{
@@ -719,11 +835,12 @@ static INT32 ConfigParseMAMEFile_internal(const TCHAR *pText, const TCHAR *pszFi
 	{
 		nLen = _tcslen (szLine);
 
-		if (szLine[0] == ';') continue;
+		if (szLine[0] == ';')
+			continue;
 
 		/*
 		 // find the cheat flags & 0x80000000 cheats (for debugging) -dink
-		 int derpy = 0;
+		 INT32 derpy = 0;
 		 for (INT32 i = 0; i < nLen; i++) {
 		 	if (szLine[i] == ':') {
 		 		derpy++;
@@ -739,8 +856,10 @@ static INT32 ConfigParseMAMEFile_internal(const TCHAR *pText, const TCHAR *pszFi
 #else
 		if (_tcsncmp (szLine, gName, strlen(gName))) {
 #endif
-			if (nFound) break;
-			else continue;
+			if (nFound)
+				break;
+			else
+				continue;
 		}
 
 		if (_tcsstr(szLine, _T("----:REASON"))) {
@@ -789,7 +908,8 @@ static INT32 ConfigParseMAMEFile_internal(const TCHAR *pText, const TCHAR *pszFi
 
 		// & 0x4000 = don't add to list
 		// & 0x0800 = BCD
-		if (flags & 0x00004800) continue;			// skip various cheats (unhandled methods at this time)
+		if (flags & 0x00004800)
+			continue;			// skip various cheats (unhandled methods at this time)
 
 		if ((flags & 0xff000000) == 0x39000000 && IS_MIDWAY) {
 			nAddress |= 0xff800000 >> 3; // 0x39 = address is relative to system's ROM block, only midway uses this kinda cheats
@@ -866,7 +986,8 @@ static INT32 ConfigParseMAMEFile_internal(const TCHAR *pText, const TCHAR *pszFi
 					INT32 nStartValue = (flags & 0x400) ? 1 : 0; // starting value
 
 					//bprintf(0, _T("adding .. %X. options\n"), nTotal);
-					if (nTotal > 0xff) continue; // bad entry (roughrac has this)
+					if (nTotal > 0xff)
+						continue; // bad entry (roughrac has this)
 					for (nValue = nStartValue; nValue < nTotal; nValue++) {
 #if defined(UNICODE)
 						swprintf(tmp2, L"# %d.", nValue + nPlus1);
@@ -936,17 +1057,19 @@ static INT32 ConfigParseMAMEFile_internal(const TCHAR *pText, const TCHAR *pszFi
 	}
 
 	// if no cheat was found, don't return success code
-	if (pCurrentCheat == NULL) return 1;
+	if (pCurrentCheat == NULL)
+		return 1;
 
 	return 0;
 }
 
-static INT32 ConfigParseMAMEFile(int is_wayder)
+static INT32 ConfigParseMAMEFile(INT32 is_wayder)
 {
 	TCHAR szFileName[MAX_PATH] = _T("");
 
 	if (is_wayder) {
-		if (HW_NES || HW_SNES) return 1;
+		if (HW_NES || HW_SNES)
+			return 1;
 		_stprintf(szFileName, _T("%swayder_cheat.dat"), szAppCheatsPath);
 	} else {
 		if (HW_NES) {
@@ -976,13 +1099,14 @@ static INT32 ConfigParseMAMEFile(int is_wayder)
 	return ret;
 }
 
-static int encodeNES(int address, int value, int compare, char *result) {
+static INT32 encodeNES(INT32 address, INT32 value, INT32 compare, char *result)
+{
 	const char ALPHABET_NES[2][16+1] = { { "APZLGITYEOXUKSVN" }, { "apzlgityeoxuksvn" } };
 
 	bool address_lower = !(address & 0x8000);
 
-	unsigned int genie = ((value & 0x80) >> 4) | (value & 0x7);
-    unsigned int temp = ((address & 0x80) >> 4) | ((value & 0x70) >> 4);
+	UINT32 genie = ((value & 0x80) >> 4) | (value & 0x7);
+	UINT32 temp = ((address & 0x80) >> 4) | ((value & 0x70) >> 4);
 	genie <<= 4;
 	genie |= temp;
 
@@ -1024,8 +1148,8 @@ static int encodeNES(int address, int value, int compare, char *result) {
 
 	result[6] = result[7] = result[8] = 0;
 
-	for (int i = 0; i < ((compare != -1) ? 8 : 6); i++) {
-		result[((compare != -1) ? 8 : 6) - 1 - i] = ALPHABET_NES[address_lower][(genie >> (i * 4)) & 0xF];
+	for (INT32 i = 0; i < ((compare != -1) ? 8 : 6); i++) {
+		result[((compare != -1) ? 8 : 6) - 1 - i] = ALPHABET_NES[address_lower][(genie >> (i * 4)) & 0x0f];
 	}
 
 	return 0;
@@ -1083,12 +1207,13 @@ static INT32 ConfigParseVCT(TCHAR* pszFilename)
 	{
 		nLen = _tcslen (szLine);
 
-		while ((nLen > 0) && (szLine[nLen - 1] == 0x0A || szLine[nLen - 1] == 0x0D)) {
+		while ((nLen > 0) && (szLine[nLen - 1] == 0x0a || szLine[nLen - 1] == 0x0d)) {
 			szLine[nLen - 1] = 0;
 			nLen--;
 		}
 
-		if (szLine[0] == ';') continue;
+		if (szLine[0] == ';')
+			continue;
 
 		INT32 c0[16], c1 = 0, cprev = 0; // find columns / break
 		for (INT32 i = 0; i < nLen; i++)
@@ -1115,18 +1240,22 @@ static INT32 ConfigParseVCT(TCHAR* pszFilename)
 
 			// split up "0077-01-FF" format: "address-[attribute][bytecount]-bytes_to_program"
 			char *tok = strtok(temp2, "-");
-			if (!tok) continue;
+			if (!tok)
+				continue;
 			sscanf(tok, "%x", &fAddr);
 
 			tok = strtok(NULL, "-");
-			if (!tok) continue;
+			if (!tok)
+				continue;
 			sscanf(tok, "%x", &fCount);
 			fAttr = (fCount & 0x30) >> 4;
 			fCount &= 0x07;
-			if (fCount < 1 || fCount > 4) fCount = 1;
+			if (fCount < 1 || fCount > 4)
+				fCount = 1;
 
 			tok = strtok(NULL, "-");
-			if (!tok) continue;
+			if (!tok)
+				continue;
 			sscanf(tok, "%x", &fBytes);
 
 			//bprintf(0, _T(".vct: addr[%x] count[%x] bytes[%x]\n"), fAddr, fCount, fBytes);
@@ -1154,7 +1283,7 @@ static INT32 ConfigParseVCT(TCHAR* pszFilename)
 			n++;
 			OptionName(_T("Enabled"));
 
-			for (int i = 0; i < fCount; i++) {
+			for (INT32 i = 0; i < fCount; i++) {
 				memset(szGGenie, 0, sizeof(szGGenie));
 				encodeNES(fAddr + i, fBytes >> (i*8), -1, szGGenie);
 				INT32 cLen = strlen(szGGenie);
@@ -1169,7 +1298,8 @@ static INT32 ConfigParseVCT(TCHAR* pszFilename)
 	free(text);
 
 	// if no cheat was found, don't return success code
-	if (pCurrentCheat == NULL) return 1;
+	if (pCurrentCheat == NULL)
+		return 1;
 
 	return 0;
 }
