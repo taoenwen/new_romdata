@@ -188,10 +188,12 @@ static struct BurnDriver** LinkBurnDrivers(const UINT32 intlCount)
 
 extern "C" INT32 BurnReserveExtlDrivers(UINT32 nAdditional)
 {
-	if (nAdditional > ~0U - nBurnDrvCount) return 1;
+	if (nAdditional > ~0U - nBurnDrvCount)
+		return 1;
 
 	UINT32 nRequired = nBurnDrvCount + nAdditional;
-	if (nRequired <= nDriverExCapacity) return 0;
+	if (nRequired <= nDriverExCapacity)
+		return 0;
 
 	UINT32 nCapacity = nDriverExCapacity ? nDriverExCapacity : 32;
 	while (nCapacity < nRequired) {
@@ -201,10 +203,12 @@ extern "C" INT32 BurnReserveExtlDrivers(UINT32 nAdditional)
 		}
 		nCapacity *= 2;
 	}
-	if ((size_t)nCapacity > (size_t)-1 / sizeof(struct BurnDriver*)) return 1;
+	if ((size_t)nCapacity > (size_t)-1 / sizeof(struct BurnDriver*))
+		return 1;
 
 	struct BurnDriver** arr = (struct BurnDriver**)realloc(pDriverEx, (size_t)nCapacity * sizeof(struct BurnDriver*));
-	if (!arr) return 1;
+	if (!arr)
+		return 1;
 
 	memset(arr + nDriverExCapacity, 0, (size_t)(nCapacity - nDriverExCapacity) * sizeof(struct BurnDriver*));
 	pDriverEx = arr;
@@ -216,7 +220,8 @@ extern "C" INT32 BurnReserveExtlDrivers(UINT32 nAdditional)
 // every dynamically created RomData driver appended at the end of the list.
 extern "C" UINT32 LinkExtlDrivers(struct BurnDriver* drv, UINT32* pallCount)
 {
-	if (!drv || !pallCount || *pallCount != nBurnDrvCount || BurnReserveExtlDrivers(1)) return ~0U;
+	if (!drv || !pallCount || *pallCount != nBurnDrvCount || BurnReserveExtlDrivers(1))
+		return ~0U;
 
 	UINT32 i = *pallCount;
 	pDriverEx[i] = drv;
@@ -228,10 +233,12 @@ extern "C" UINT32 LinkExtlDrivers(struct BurnDriver* drv, UINT32* pallCount)
 // Remove one runtime-added driver and close the gap, so the remaining indices stay valid.
 extern "C" INT32 UnlinkExtlDriver(struct BurnDriver* drv)
 {
-	if (drv == NULL || pDriverEx == NULL) return 1;
+	if (drv == NULL || pDriverEx == NULL)
+		return 1;
 
 	for (UINT32 i = nIntlDrvCount; i < nBurnDrvCount; i++) {
-		if (pDriverEx[i] != drv) continue;
+		if (pDriverEx[i] != drv)
+			continue;
 
 		if (i + 1 < nBurnDrvCount) {
 			memmove(pDriverEx + i, pDriverEx + i + 1, (nBurnDrvCount - i - 1) * sizeof(struct BurnDriver*));
@@ -239,12 +246,16 @@ extern "C" INT32 UnlinkExtlDriver(struct BurnDriver* drv)
 		nBurnDrvCount--;
 		pDriverEx[nBurnDrvCount] = NULL;
 
-		if (nBurnDrvActive > i && nBurnDrvActive < ~0U) nBurnDrvActive--;
-		else if (nBurnDrvActive == i) nBurnDrvActive = ~0U;
+		if (nBurnDrvActive > i && nBurnDrvActive < ~0U)
+			nBurnDrvActive--;
+		else if (nBurnDrvActive == i)
+			nBurnDrvActive = ~0U;
 
 		for (INT32 nSlot = 0; nSlot < 8; nSlot++) {
-			if (nBurnDrvSelect[nSlot] > i && nBurnDrvSelect[nSlot] < ~0U) nBurnDrvSelect[nSlot]--;
-			else if (nBurnDrvSelect[nSlot] == i) nBurnDrvSelect[nSlot] = ~0U;
+			if (nBurnDrvSelect[nSlot] > i && nBurnDrvSelect[nSlot] < ~0U)
+				nBurnDrvSelect[nSlot]--;
+			else if (nBurnDrvSelect[nSlot] == i)
+				nBurnDrvSelect[nSlot] = ~0U;
 		}
 		return 0;
 	}
