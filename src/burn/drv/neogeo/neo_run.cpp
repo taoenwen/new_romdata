@@ -4074,22 +4074,7 @@ static INT32 NeoInitCommon()
 		SekMapMemory(Neo68KROMActive + (nAllCodeSize - nIpsMemExpLen[EXTR_ROM]), 0x900000, 0x900000 + (nIpsMemExpLen[EXTR_ROM] - 1), MAP_ROM);
 	}
 	// For romdata
-	if ((NULL != pDataRomDesc) && (NULL != pRDI->szExtraRom))
-	{
-		UINT32 nRomLen = 0, nExtraRomLen = 0;
-		for (INT32 i = 0; i < pRDI->nDescCount; i++) {
-			if (1 == (pDataRomDesc[i].nType & 7)) {								// P Roms
-				nRomLen += pDataRomDesc[i].nLen;
-
-				if (0 == strcmp(pDataRomDesc[i].szName, pRDI->szExtraRom)) {	// Extra rom
-					nExtraRomLen = pDataRomDesc[i].nLen;
-				}
-			}
-		}
-		if ((nExtraRomLen > 0) && (nExtraRomLen < nRomLen)) {
-			SekMapMemory(Neo68KROMActive + (nRomLen - nExtraRomLen), 0x900000, 0x900000 + (nExtraRomLen - 1), MAP_ROM);
-		}
-	}
+	NeoProcessExtraRom(Neo68KROMActive);
 
 	ZetClose();
 	SekClose();
@@ -4220,7 +4205,7 @@ static bool recursing = false;
 
 INT32 NeoInit()
 {
-	nNeo68KRAMLen = ((nNeo68KRAMHack > 0) || (nIpsDrvDefine & IPS_NEO_RAMHACK) || (NULL != pDataRomDesc)) ? 0x100000 : 0x010000;
+	nNeo68KRAMLen = ((nNeo68KRAMHack > 0) || (nIpsDrvDefine & IPS_NEO_RAMHACK) || IsRomDataDrv()) ? 0x100000 : 0x010000;
 
 	if (recursing) {
 		if (LoadRoms()) {
@@ -5171,4 +5156,28 @@ INT32 NeoFrame()
 	}
 
 	return 0;
+}
+
+extern "C" void NeoProcessExtraRom(UINT8* rom)
+{
+	if (!IsRomDataDrv()) return;
+
+	const char* pszExtName = RomDataDrvGetExtName();
+	if (!pszExtName || !pszExtName[0]) return;
+
+	UINT32 nRomCount = 0;
+	struct BurnRomInfo* pRI = RomDataDrvGetRomInfo(&nRomCount);
+	if (!pRI) return;
+
+	UINT32 romLen = 0, exromLen = 0;
+	for (UINT32 i = 0; i < nRomCount; i++) {
+		const struct BurnRomInfo* ri = &pRI[i];
+		if (ri->szName && 0 == strcmp(ri->szName, pszExtName))
+			exromLen = ri->nLen;
+		if (1 == (ri->nType & 7))						// Neo Geo P-ROMs
+			romLen += ri->nLen;
+	}
+	if (0 == exromLen || romLen <= exromLen) return;
+
+	SekMapMemory(rom + (romLen - exromLen), 0x900000, 0x900000 + (exromLen - 1), MAP_ROM);
 }

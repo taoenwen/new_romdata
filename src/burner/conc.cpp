@@ -2,6 +2,149 @@
 #include "burner.h"
 #include "neocdlist.h"
 
+//  New-style text loading: read entire file into memory, auto-detect encoding,
+//  convert to TCHAR text in-memory (no CRT ccs mode, no in-place disk rewriting).
+
+enum { CONC_ENC_ANSI, CONC_ENC_UTF8, CONC_ENC_UTF8_BOM, CONC_ENC_UTF16_LE, CONC_ENC_UTF16_BE };
+
+static bool conc_is_valid_utf8(const unsigned char* buf, size_t len)
+{
+	size_t p = 0;
+	while (p < len) {
+		unsigned char c = buf[p];
+		if (c < 0x80) { p++; continue; }
+		int nExtra;
+		if      (c >= 0xC2 && c <= 0xDF) nExtra = 1;
+		else if (c >= 0xE0 && c <= 0xEF) nExtra = 2;
+		else if (c >= 0xF0 && c <= 0xF4) nExtra = 3;
+		else return false;
+		for (int i = 1; i <= nExtra; i++) {
+			if (p + (size_t)i >= len) return false;
+			if (0x80 != (buf[p + i] & 0xC0)) return false;
+		}
+		p += nExtra + 1;
+	}
+	return true;
+}
+
+static int conc_detect_encoding(const unsigned char* buf, size_t len)
+{
+	if (len >= 3 && buf[0] == 0xEF && buf[1] == 0xBB && buf[2] == 0xBF)	return CONC_ENC_UTF8_BOM;
+	if (len >= 2 && buf[0] == 0xFF && buf[1] == 0xFE)					return CONC_ENC_UTF16_LE;
+	if (len >= 2 && buf[0] == 0xFE && buf[1] == 0xFF)					return CONC_ENC_UTF16_BE;
+	if (len == 0)														return CONC_ENC_ANSI;
+	size_t scan = len < 4096 ? len : 4096;
+	size_t zeroEven = 0, zeroOdd = 0;
+	for (size_t i = 0; i < scan; i++) {
+		if (buf[i] == 0x00) { if (i & 1) zeroOdd++; else zeroEven++; }
+	}
+	if ((zeroEven + zeroOdd) * 4 >= scan) {
+		if (zeroOdd  > zeroEven * 4) return CONC_ENC_UTF16_LE;
+		if (zeroEven > zeroOdd  * 4) return CONC_ENC_UTF16_BE;
+	}
+	return conc_is_valid_utf8(buf, len) ? CONC_ENC_UTF8 : CONC_ENC_ANSI;
+}
+
+// Read entire file into a malloc'd TCHAR buffer (UTF-8→TCHAR on non-Win32;
+// UTF-8→UTF-16 wchar_t on Win32 _UNICODE).  Caller must free().
+static TCHAR* conc_load_text(const TCHAR* pszFileName)
+{
+	FILE* fp = _tfopen(pszFileName, _T("rb"));
+	if (!fp) return NULL;
+	if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return NULL; }
+	long sz = ftell(fp);
+	if (sz < 0) { fclose(fp); return NULL; }
+	rewind(fp);
+	unsigned char* raw = (unsigned char*)malloc((size_t)sz + 1);
+	if (!raw) { fclose(fp); return NULL; }
+	size_t got = fread(raw, 1, (size_t)sz, fp);
+	raw[got] = 0;
+	fclose(fp);
+
+	int enc = conc_detect_encoding(raw, got);
+
+	// Step 1: decode raw bytes to UTF-8 (malloc'd, caller-freed path returns this later on non-Win32)
+	char* u8;
+	if (enc == CONC_ENC_UTF8 || enc == CONC_ENC_ANSI) {
+#ifdef BUILD_WIN32
+		if (enc == CONC_ENC_ANSI) {
+			INT32 wn = MultiByteToWideChar(CP_ACP, 0, (char*)raw, (INT32)got, NULL, 0);
+			if (wn > 0) {
+				wchar_t* w = (wchar_t*)malloc((size_t)(wn + 1) * sizeof(wchar_t));
+				if (w) {
+					MultiByteToWideChar(CP_ACP, 0, (char*)raw, (INT32)got, w, wn);
+					w[wn] = 0;
+					free(raw);
+					return (TCHAR*)w;
+				}
+			}
+		}
+#endif
+		u8 = (char*)raw;
+	} else if (enc == CONC_ENC_UTF8_BOM) {
+		memmove(raw, raw + 3, got - 3 + 1);
+		u8 = (char*)raw;
+	} else {
+		// UTF-16 LE/BE → UTF-8
+		size_t start = 2;
+		size_t units = (got - start) / 2;
+		u8 = (char*)malloc(units * 3 + 1);
+		if (!u8) { free(raw); return NULL; }
+		size_t o = 0;
+		for (size_t i = 0; i < units; i++) {
+			unsigned int cp;
+			unsigned char b0 = raw[start + i*2 + 0];
+			unsigned char b1 = raw[start + i*2 + 1];
+			cp = (enc == CONC_ENC_UTF16_LE) ? (unsigned int)(b0 | (b1 << 8))
+			                               : (unsigned int)(b1 | (b0 << 8));
+			if (cp < 0x80) {
+				u8[o++] = (char)cp;
+			} else if (cp < 0x800) {
+				u8[o++] = (char)(0xC0 | (cp >> 6));
+				u8[o++] = (char)(0x80 | (cp & 0x3F));
+			} else {
+				u8[o++] = (char)(0xE0 | (cp >> 12));
+				u8[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+				u8[o++] = (char)(0x80 | (cp & 0x3F));
+			}
+		}
+		u8[o] = 0;
+		free(raw);
+	}
+
+#ifdef _UNICODE
+	// Win32 TCHAR = wchar_t (UTF-16): convert UTF-8 to wchar_t
+	INT32 wn = MultiByteToWideChar(CP_UTF8, 0, u8, -1, NULL, 0);
+	if (wn <= 0) { free(u8); return NULL; }
+	wchar_t* w = (wchar_t*)malloc((size_t)wn * sizeof(wchar_t));
+	if (!w) { free(u8); return NULL; }
+	MultiByteToWideChar(CP_UTF8, 0, u8, -1, w, wn);
+	free(u8);
+	return (TCHAR*)w;
+#else
+	// Non-Win32 TCHAR = char: UTF-8 is directly usable
+	return (TCHAR*)u8;
+#endif
+}
+
+// In-memory replacement for _fgetts: copies next line (up to \n inclusive)
+// into szLine, null-terminates.  *ppSave is advanced.  Returns szLine or NULL at EOF.
+static TCHAR* conc_gets(TCHAR* szLine, INT32 nMaxLen, const TCHAR* pText, TCHAR** ppSave)
+{
+	TCHAR* p = *ppSave ? *ppSave : (TCHAR*)pText;
+	if (!p || *p == _T('\0')) return NULL;
+	INT32 i = 0;
+	while (i < nMaxLen - 1 && *p && *p != _T('\n')) {
+		szLine[i++] = *p++;
+	}
+	if (*p == _T('\n') && i < nMaxLen - 1) {
+		szLine[i++] = *p++;
+	}
+	szLine[i] = _T('\0');
+	*ppSave = p;
+	return szLine;
+}
+
 // GameGenie stuff is handled a little differently..
 #define HW_NES ( ((BurnDrvGetHardwareCode() & HARDWARE_PUBLIC_MASK) == HARDWARE_NES) || ((BurnDrvGetHardwareCode() & HARDWARE_PUBLIC_MASK) == HARDWARE_FDS) )
 #define HW_SNES ( ((BurnDrvGetHardwareCode() & HARDWARE_PUBLIC_MASK) == HARDWARE_SNES) )
@@ -117,31 +260,24 @@ static INT32 ConfigParseFile(TCHAR* pszFilename)
 	INT32 nLine = 0;
 	TCHAR nInside = INSIDE_NOTHING;
 
-	TCHAR* pszReadMode = AdaptiveEncodingReads(pszFilename);
-	if (NULL == pszReadMode) pszReadMode = _T("rt");
-
-	FILE* h = _tfopen(pszFilename, pszReadMode);
+	TCHAR* text = conc_load_text(pszFilename);
 	TCHAR* pszFileHeading = getFilenameFromPath(pszFilename);
-	if (h == NULL) {
+	if (text == NULL) {
 		if ((BurnDrvGetFlags() & BDF_CLONE) && BurnDrvGetText(DRV_PARENT)) {
 			TCHAR szAlternative[MAX_PATH] = { 0 };
 			_stprintf(szAlternative, _T("%s%s.ini"), szAppCheatsPath, BurnDrvGetText(DRV_PARENT));
 
-			pszReadMode = AdaptiveEncodingReads(szAlternative);
-			if (NULL == pszReadMode) pszReadMode = _T("rt");
-
-			if (NULL == (h = _tfopen(szAlternative, pszReadMode)))
+			text = conc_load_text(szAlternative);
+			if (text == NULL)
 				return 1;
 			pszFileHeading = getFilenameFromPath(szAlternative);
 		} else {
-			return 1;	// Parent driver
+			return 1;
 		}
 	}
 
-	while (1) {
-		if (_fgetts(szLine, 8192, h) == NULL) {
-			break;
-		}
+	TCHAR* save = NULL;
+	while (conc_gets(szLine, 8192, text, &save) != NULL) {
 
 		nLine++;
 
@@ -374,9 +510,7 @@ static INT32 ConfigParseFile(TCHAR* pszFilename)
 
 	}
 
-	if (h) {
-		fclose(h);
-	}
+	free(text);
 
 	return 0;
 }
@@ -385,24 +519,19 @@ static INT32 ConfigParseFile(TCHAR* pszFilename)
 //TODO: make cross platform
 static INT32 ConfigParseNebulaFile(TCHAR* pszFilename)
 {
-	TCHAR* pszReadMode = AdaptiveEncodingReads(pszFilename);
-	if (NULL == pszReadMode) pszReadMode = _T("rt");
-
-	FILE *fp = _tfopen(pszFilename, pszReadMode);
+	TCHAR* text = conc_load_text(pszFilename);
 	TCHAR* pszFileHeading = getFilenameFromPath(pszFilename);
-	if (fp == NULL) {
+	if (text == NULL) {
 		if ((BurnDrvGetFlags() & BDF_CLONE) && BurnDrvGetText(DRV_PARENT)) {
 			TCHAR szAlternative[MAX_PATH] = { 0 };
 			_stprintf(szAlternative, _T("%s%s.dat"), szAppCheatsPath, BurnDrvGetText(DRV_PARENT));
 
-			pszReadMode = AdaptiveEncodingReads(szAlternative);
-			if (NULL == pszReadMode) pszReadMode = _T("rt");
-
-			if (NULL == (fp = _tfopen(szAlternative, pszReadMode)))
+			text = conc_load_text(szAlternative);
+			if (text == NULL)
 				return 1;
 			pszFileHeading = getFilenameFromPath(szAlternative);
 		} else {
-			return 1;	// Parent driver
+			return 1;
 		}
 	}
 
@@ -412,12 +541,15 @@ static INT32 ConfigParseNebulaFile(TCHAR* pszFilename)
 	TCHAR szLine[1024];
 	bool bFirst = true;
 
-	while (1)
+	TCHAR* save = NULL;
+	while (conc_gets(szLine, 1024, text, &save) != NULL)
 	{
-		if (_fgetts(szLine, 1024, fp) == NULL)
-			break;
-
 		nLen = _tcslen(szLine);
+
+		while ((nLen > 0) && (szLine[nLen - 1] == 0x0A || szLine[nLen - 1] == 0x0D)) {
+			szLine[nLen - 1] = 0;
+			nLen--;
+		}
 
 		if (nLen < 3 || szLine[0] == '[') continue;
 
@@ -516,14 +648,14 @@ static INT32 ConfigParseNebulaFile(TCHAR* pszFilename)
 		n++;
 	}
 
-	fclose (fp);
+	free(text);
 
 	return 0;
 }
 
 #define IS_MIDWAY ((BurnDrvGetHardwareCode() & HARDWARE_PREFIX_MIDWAY) == HARDWARE_PREFIX_MIDWAY)
 
-static INT32 ConfigParseMAMEFile_internal(FILE *fz, const TCHAR *pszFileHeading, const TCHAR *name)
+static INT32 ConfigParseMAMEFile_internal(const TCHAR *pText, const TCHAR *pszFileHeading, const TCHAR *name)
 {
 #define AddressInfo()	\
 	INT32 k = (flags >> 20) & 3;	\
@@ -582,11 +714,9 @@ static INT32 ConfigParseMAMEFile_internal(FILE *fz, const TCHAR *pszFileHeading,
 
 	_stprintf(gName, _T(":%s:"), name);
 
-	while (1)
+	TCHAR* save = NULL;
+	while (conc_gets(szLine, 1024, pText, &save) != NULL)
 	{
-		if (_fgetts(szLine, 1024, fz) == NULL)
-			break;
-
 		nLen = _tcslen (szLine);
 
 		if (szLine[0] == ';') continue;
@@ -828,23 +958,19 @@ static INT32 ConfigParseMAMEFile(int is_wayder)
 		}
 	}
 
-	TCHAR* pszReadMode = AdaptiveEncodingReads(szFileName);
-	if (NULL == pszReadMode) pszReadMode = _T("rt");
-
-	FILE *fz = _tfopen(szFileName, pszReadMode);
+	TCHAR* text = conc_load_text(szFileName);
 	TCHAR* pszFileHeading = getFilenameFromPath(szFileName);
 
 	INT32 ret = 1;
 
-	if (fz) {
-		ret = ConfigParseMAMEFile_internal(fz, pszFileHeading, BurnDrvGetText(DRV_NAME));
-		// let's try using parent entry as a fallback if no cheat was found for this romset
+	if (text) {
+		ret = ConfigParseMAMEFile_internal(text, pszFileHeading, BurnDrvGetText(DRV_NAME));
+		// try parent entry as fallback
 		if (ret && (BurnDrvGetFlags() & BDF_CLONE) && BurnDrvGetText(DRV_PARENT)) {
-			fseek(fz, 0, SEEK_SET);
-			ret = ConfigParseMAMEFile_internal(fz, pszFileHeading, BurnDrvGetText(DRV_PARENT));
+			ret = ConfigParseMAMEFile_internal(text, pszFileHeading, BurnDrvGetText(DRV_PARENT));
 		}
 
-		fclose(fz);
+		free(text);
 	}
 
 	return ret;
@@ -936,34 +1062,31 @@ static INT32 ConfigParseVCT(TCHAR* pszFilename)
 
 	bool bFirst = true;
 
-	TCHAR* pszReadMode = AdaptiveEncodingReads(pszFilename);
-	if (NULL == pszReadMode) pszReadMode = _T("rt");
-
-	FILE* h = _tfopen(pszFilename, pszReadMode);
+	TCHAR* text = conc_load_text(pszFilename);
 	TCHAR* pszFileHeading = getFilenameFromPath(pszFilename);
-	if (h == NULL) {
+	if (text == NULL) {
 		if ((BurnDrvGetFlags() & BDF_CLONE) && BurnDrvGetText(DRV_PARENT)) {
 			TCHAR szAlternative[MAX_PATH] = { 0 };
 			_stprintf(szAlternative, _T("%s%s.vct"), szAppCheatsPath, BurnDrvGetText(DRV_PARENT));
 
-			pszReadMode = AdaptiveEncodingReads(szAlternative);
-			if (NULL == pszReadMode) pszReadMode = _T("rt");
-
-			if (NULL == (h = _tfopen(szAlternative, pszReadMode)))
+			text = conc_load_text(szAlternative);
+			if (text == NULL)
 				return 1;
 			pszFileHeading = getFilenameFromPath(szAlternative);
 		} else {
-			return 1;	// Parent driver
+			return 1;
 		}
 	}
 
-
-	while (1)
+	TCHAR* save = NULL;
+	while (conc_gets(szLine, 1024, text, &save) != NULL)
 	{
-		if (_fgetts(szLine, 1024, h) == NULL)
-			break;
-
 		nLen = _tcslen (szLine);
+
+		while ((nLen > 0) && (szLine[nLen - 1] == 0x0A || szLine[nLen - 1] == 0x0D)) {
+			szLine[nLen - 1] = 0;
+			nLen--;
+		}
 
 		if (szLine[0] == ';') continue;
 
@@ -1042,6 +1165,8 @@ static INT32 ConfigParseVCT(TCHAR* pszFilename)
 
 		continue;
 	}
+
+	free(text);
 
 	// if no cheat was found, don't return success code
 	if (pCurrentCheat == NULL) return 1;

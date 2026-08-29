@@ -847,7 +847,7 @@ INT32 pgmInit()
 	BurnSetRefreshRate(59.185606);
 
 	nEnableArm7 = (BurnDrvGetHardwareCode() / HARDWARE_IGS_USE_ARM_CPU) & 1;
-	OldCodeMode = ((HackCodeDip & 1) || (bDoIpsPatch) || (NULL != pDataRomDesc)) ? 1 : 0;
+	OldCodeMode = ((HackCodeDip & 1) || (bDoIpsPatch) || IsRomDataDrv()) ? 1 : 0;
 
 	if (0 == nPGMSpriteBufferHack) {
 		nPGMSpriteBufferHack = (nIpsDrvDefine & IPS_PGM_SPRHACK) ? 1 : 0;
@@ -976,7 +976,6 @@ INT32 pgmInit()
 
 	v3021Init();
 	ics2115_init(ics2115_sound_irq, ICSSNDROM, nPGMSNDROMLen);
-	ics_2115_set_volume(2.0);
 	BurnTimerAttachZet(Z80_FREQ);
 
 	pBurnDrvPalette = (UINT32*)PGMPalRAM;
