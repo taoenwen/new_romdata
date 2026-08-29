@@ -1691,6 +1691,29 @@ static INT32 rd_build_and_link(struct RomDataParsed* pp)
 //  Public API
 // =============================================================================
 
+extern "C" INT32 RomDataIdentify(const TCHAR* szDatPath, char* szShortName, INT32 nShortNameLen)
+{
+	if (rd_is_empty(szDatPath) || !rd_is_dat(szDatPath))
+		return 0;
+
+	char* text = rd_load_text(szDatPath);
+	if (!text)
+		return 0;
+
+	struct RomDataParsed Parsed;
+	INT32 nResult = rd_parse_text(text, szDatPath, &Parsed);
+	free_s((void**)&text);
+	if (nResult != 0) {
+		rd_parsed_free(&Parsed);
+		return 0;
+	}
+
+	if (szShortName && nShortNameLen > 0)
+		snprintf(szShortName, nShortNameLen, "%s", Parsed.szShortName);
+	rd_parsed_free(&Parsed);
+	return 1;
+}
+
 static INT32 rd_load_parsed_text(const TCHAR* szDatPath, UINT64 nSize, UINT64 nWriteTime, struct RomDataParsed* pParsed)
 {
 	char* text = rd_load_text(szDatPath);
@@ -1929,6 +1952,13 @@ extern "C" INT32 RomDataLoadOne(const TCHAR* szDatPath)
 	return nIndex;
 }
 
+extern "C" INT32 RomDataCopyOne(const TCHAR* szDatPath, const TCHAR* szDestDir)
+{
+	if (rd_is_empty(szDatPath) || !rd_is_dat(szDatPath) || rd_is_empty(szDestDir))
+		return 0;
+	return rd_import_file(szDatPath, szDestDir);
+}
+
 extern "C" INT32 RomDataImportOne(const TCHAR* szDatPath, const TCHAR* szDestDir)
 {
 	UINT32 nCount = nBurnDrvCount;
@@ -1936,7 +1966,7 @@ extern "C" INT32 RomDataImportOne(const TCHAR* szDatPath, const TCHAR* szDestDir
 	if (nIndex < 0)
 		return -1;
 	if (nBurnDrvCount > nCount)
-		rd_import_file(szDatPath, szDestDir);
+		RomDataCopyOne(szDatPath, szDestDir);
 	return nIndex;
 }
 
@@ -2065,7 +2095,7 @@ extern "C" void RomDataImportDirectory(const TCHAR* szDir, const TCHAR* szDestDi
 	}
 }
 
-extern "C" void RomDataScan(const TCHAR* szDir, const TCHAR* szRequestedCachePath)
+static void rd_scan(const TCHAR* szDir, const TCHAR* szRequestedCachePath, INT32 bAppend)
 {
 	if (rd_is_empty(szDir))
 		return;
@@ -2077,8 +2107,9 @@ extern "C" void RomDataScan(const TCHAR* szDir, const TCHAR* szRequestedCachePat
 		return;
 	}
 
-	RomDataFree();
-	if (rd_reserve_records(Candidates.nCount) || BurnReserveExtlDrivers(Candidates.nCount)) {
+	if (!bAppend)
+		RomDataFree();
+	if (rd_reserve_records(nRDDrvCount + Candidates.nCount) || BurnReserveExtlDrivers(Candidates.nCount)) {
 		bprintf(PRINT_ERROR, _T("RomData: out of memory reserving %u driver(s)\n"), Candidates.nCount);
 		free_s((void**)&Candidates.pPaths);
 		return;
@@ -2193,6 +2224,16 @@ extern "C" void RomDataScan(const TCHAR* szDir, const TCHAR* szRequestedCachePat
 		bprintf(st.nFailed ? PRINT_ERROR : PRINT_NORMAL, _T("RomData: added %u, skipped %u, failed %u of %u .dat file(s), %u cache hit(s), from '%s'\n"),
 				st.nLoaded, st.nSkipped, st.nFailed, st.nLoaded + st.nSkipped + st.nFailed, nCacheHits, szDir);
 	}
+}
+
+extern "C" void RomDataScan(const TCHAR* szDir, const TCHAR* szCachePath)
+{
+	rd_scan(szDir, szCachePath, 0);
+}
+
+extern "C" void RomDataScanAppend(const TCHAR* szDir, const TCHAR* szCachePath)
+{
+	rd_scan(szDir, szCachePath, 1);
 }
 
 extern "C" void RomDataFree(void)

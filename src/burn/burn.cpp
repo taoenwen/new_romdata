@@ -160,14 +160,13 @@ static void BurnGameListExit()
 {
 	// Release of storage space
 	for (UINT32 i = 0; i < nIntlDrvCount; i++) {
-		if ((NULL != pszShortName) && (NULL != pszShortName[i])) free(pszShortName[i]);
-		if ((NULL != pszFullNameA) && (NULL != pszFullNameA[i])) free(pszFullNameA[i]);
-		if ((NULL != pszFullNameW) && (NULL != pszFullNameW[i])) free(pszFullNameW[i]);
+		if ((pszShortName != NULL) && (pszShortName[i] != NULL)) free_s((void**)&pszShortName[i]);
+		if ((pszFullNameA != NULL) && (pszFullNameA[i] != NULL)) free_s((void**)&pszFullNameA[i]);
+		if ((pszFullNameW != NULL) && (pszFullNameW[i] != NULL)) free_s((void**)&pszFullNameW[i]);
 	}
-	if (NULL != pszShortName) free(pszShortName);
-	if (NULL != pszFullNameA) free(pszFullNameA);
-	if (NULL != pszFullNameW) free(pszFullNameW);
-	pszShortName = NULL; pszFullNameA = NULL; pszFullNameW = NULL;
+	if (pszShortName != NULL) free_s((void**)&pszShortName);
+	if (pszFullNameA != NULL) free_s((void**)&pszFullNameA);
+	if (pszFullNameW != NULL) free_s((void**)&pszFullNameW);
 }
 
 // A dynamically created `pDriverEx` will directly reference the static `pDriver`
@@ -272,7 +271,7 @@ extern "C" INT32 BurnLibInit()
 {
 	BurnLibExit();
 
-	nIntlDrvCount = nBurnDrvCount = sizeof(pDriver) / sizeof(pDriver[0]);	// count available drivers
+	nIntlDrvCount = nBurnDrvCount = ARRAY_SIZE(pDriver);	// count available drivers
 	pDriverEx = LinkBurnDrivers(nIntlDrvCount);				// Link the static driver list into the extended driver list
 	nDriverExCapacity = pDriverEx ? nIntlDrvCount : 0;
 
