@@ -18,6 +18,9 @@
 #include <stdint.h>
 #include <sys/stat.h>
 #ifdef BUILD_WIN32
+#if defined(_UNICODE) && !defined(UNICODE)
+#define UNICODE
+#endif
 #include <windows.h>
 #include <io.h>
 #else
