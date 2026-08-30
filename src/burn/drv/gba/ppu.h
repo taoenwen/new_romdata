@@ -843,8 +843,13 @@ static inline void gba_ppu_event(gba_t* gba, sb_emu_state_t* emu, UINT32 cycles_
 		gba_send_interrupt(gba, 3, new_if);
 	}
 
-	if (!render)
+	if (!render) {
+		// skip frames: no pixel work, but the event must stay scheduled
+		gba_timing_deschedule(gba, &gba->ppu_event);
+		gba_timing_schedule(gba, &gba->ppu_event,
+		                    fast_forward_ticks + 1 - (INT32)cycles_late);
 		return;
+	}
 
 	if (lcd_x == 0) {
 		// Affine reference updated at scanline start so the per-line increment uses
@@ -907,4 +912,1125 @@ static inline void gba_ppu_event(gba_t* gba, sb_emu_state_t* emu, UINT32 cycles_
 	gba_timing_schedule(gba, &gba->ppu_event, fast_forward_ticks + 1 - (INT32)cycles_late);
 }
 
+// ============================================================================
+// Multi-threaded PPU renderer: worker thread + per-scanline snapshots
+// ============================================================================
+// Uncomment the next line to force-disable multi-threading (single-thread fallback).
+// #define GBA_DISABLE_MT
+
+// ---- Platform detection ---------------------------------------------------
+#if !defined(GBA_DISABLE_MT)
+
+#  if defined(__unix__) || defined(__APPLE__) || defined(__ANDROID__) || \
+      defined(__linux__) || defined(__HAIKU__)
+#    include <pthread.h>
+#    include <semaphore.h>
+#    include <fcntl.h>
+#    include <errno.h>
+#    include <stdio.h>
+#    define GBA_HAVE_PTHREAD   1
+#    define GBA_HAVE_WINTHREAD 0
+
+#  elif defined(_WIN32) || defined(BUILD_WIN32)
+#    ifndef WIN32_LEAN_AND_MEAN
+#      define WIN32_LEAN_AND_MEAN
+#    endif
+#    ifndef NOMINMAX
+#      define NOMINMAX
+#    endif
+#    include <windows.h>
+#    define GBA_HAVE_PTHREAD   0
+#    define GBA_HAVE_WINTHREAD 1
+#  else
+#    define GBA_HAVE_PTHREAD   0
+#    define GBA_HAVE_WINTHREAD 0
+#  endif
+#else
+#  define GBA_HAVE_PTHREAD   0
+#  define GBA_HAVE_WINTHREAD 0
 #endif
+
+#if !defined(GBA_HAVE_PTHREAD)
+#  define GBA_HAVE_PTHREAD   0
+#endif
+#if !defined(GBA_HAVE_WINTHREAD)
+#  define GBA_HAVE_WINTHREAD 0
+#endif
+
+#define GBA_MT_ENABLED (GBA_HAVE_PTHREAD || GBA_HAVE_WINTHREAD)
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// ===========================================================================
+// Multi-threaded path (POSIX pthreads or Win32 threads available)
+// ===========================================================================
+#if GBA_MT_ENABLED
+
+// MMIO window captured per scanline: DISPCNT..GREENSWP (0x00..0x58 = 89 bytes,
+// rounded up to 96).  Covers every PPU register the render path reads.
+#define GBA_MT_PPU_IO_SIZE  0x60
+
+// Triple-buffered pipeline:
+//   Normal play       — blocking wait for lowest latency (~2-slot effective)
+//   Fast-forward/skip — non-blocking trywait, drop frames if worker is busy
+#define GBA_MT_N_BUFFERS    3
+
+#if GBA_MT_N_BUFFERS < 2 || GBA_MT_N_BUFFERS > 8
+#error GBA_MT_N_BUFFERS must be between 2 and 8
+#endif
+
+// ---- Data structures ------------------------------------------------------
+
+// Per-scanline packed state: MMIO + affine reference points + DISPCNT pipeline.
+// Packed into one struct so the worker installs a row in a single memcpy
+// instead of 6+ scattered assignments, and the snapshot side writes once.
+typedef struct {
+	UINT8  io[GBA_MT_PPU_IO_SIZE];
+	INT32  bgx[2];                        // BG2/BG3 affine reference X
+	INT32  bgy[2];                        // BG2/BG3 affine reference Y
+	UINT16 dispcnt_pipeline[3];           // 3-stage DISPCNT delay pipeline
+} gba_mt_line_state_t;
+
+// Per-frame snapshot handed to the worker.
+// Main thread writes snapshots[w_idx]; worker reads snapshots[r_idx].
+// The worker writes its pixel output into backbuf[r_idx] — snapshot slot and
+// backbuf slot share the same index (1:1 mapping), which simplifies invariants
+// and means a slot is either "being captured by main", "being rendered by
+// worker", or "on screen / free for reuse", never all three at once.
+typedef struct {
+	UINT8  vram[128 * 1024];
+	UINT8  oam[1024];
+	UINT8  palette[1024];
+
+	gba_mt_line_state_t line_state[GBA_LCD_H];
+	bool   line_hb_valid[GBA_LCD_H];      // hblank snapshot captured for row
+	bool   line_ls_valid[GBA_LCD_H];      // line-start snapshot captured
+	bool   vram_copied;                   // big-buffer copy done this frame
+
+	float  ghosting_strength;
+	bool   render_per_pixel;
+} gba_mt_snapshot_t;
+
+// MT control block.
+// Cross-thread ordering is provided exclusively by:
+//   - sem_wait (acquire) / sem_post (release) pairs on job_sem / done_sem
+//   - explicit full memory barriers (gba_mt_plat_mb) before each post
+// Volatile is used on fields shared between threads purely to prevent the
+// compiler from caching them in registers across semaphore calls; the real
+// visibility guarantee comes from the acquire/release semantics.
+typedef struct gba_mt_s {
+	bool enabled;
+	bool exiting;
+
+	gba_mt_snapshot_t snapshots[GBA_MT_N_BUFFERS];
+	UINT8  backbuf[GBA_MT_N_BUFFERS][GBA_LCD_W * GBA_LCD_H * 4];
+
+	volatile int w_idx;           // slot main thread is currently writing
+	volatile int r_idx;           // slot worker is currently reading/writing
+	volatile int ready_back_idx;  // last backbuf the worker completed
+	volatile int front_idx;       // backbuf currently presented on screen
+	int          presented_front_idx; // front idx last copied to the framebuffer
+	bool         presented_black;     // black frame already presented
+	UINT32       frame_count;
+
+	volatile bool want_render_this_frame;
+	volatile bool worker_busy;
+	volatile bool job_pending;
+	volatile bool have_first_frame;
+	volatile bool fast_forward;   // true while main thread is skipping renders
+
+#if GBA_HAVE_PTHREAD
+	pthread_t      worker;
+	sem_t*         job_sem;
+	sem_t*         done_sem;
+	char           job_sem_name[40];
+	char           done_sem_name[40];
+#elif GBA_HAVE_WINTHREAD
+	HANDLE         worker;
+	HANDLE         job_sem;
+	HANDLE         done_sem;
+#endif
+} gba_mt_t;
+
+extern gba_mt_t* g_gba_mt_current;
+
+// ---- Public API -----------------------------------------------------------
+static INT32  gba_mt_init(gba_mt_t* mt);
+static void   gba_mt_exit(gba_mt_t* mt);
+static void   gba_mt_reset(gba_mt_t* mt);
+static void   gba_mt_begin_frame(gba_mt_t* mt, gba_t* gba, sb_emu_state_t* emu);
+static void   gba_mt_ppu_hblank_snapshot(gba_mt_t* mt, gba_t* gba, INT32 lcd_y);
+static void   gba_mt_ppu_line_start_snapshot(gba_mt_t* mt, gba_t* gba, INT32 lcd_y);
+static void   gba_mt_ppu_vblank_entry(gba_mt_t* mt, gba_t* gba);
+static void   gba_mt_ppu_vblank_publish(gba_mt_t* mt, gba_t* gba, gba_scratch_t* scratch);
+
+static inline bool gba_mt_enabled(const gba_mt_t* mt) {
+	return mt && mt->enabled;
+}
+
+// ---- reset_slot -----------------------------------------------------------
+// Fill a snapshot slot with safe VBlank-time defaults.  If any scanline's
+// hblank / line-start snapshot is missed during fast-forward / frame-skip,
+// the row still has valid MMIO values rather than zeroes (all-zero DISPCNT
+// means all layers off → black scanlines).
+static void gba_mt_reset_slot(gba_mt_t* mt, int idx, gba_t* gba)
+{
+	gba_mt_snapshot_t* s = &mt->snapshots[idx];
+	memset(s->line_hb_valid, 0, sizeof(s->line_hb_valid));
+	memset(s->line_ls_valid, 0, sizeof(s->line_ls_valid));
+	s->vram_copied       = false;
+	s->ghosting_strength = gba->ppu.ghosting_strength;
+	s->render_per_pixel  = gba->ppu.render_per_pixel;
+
+	// Capture VBlank-time MMIO + affine + pipeline once outside the loop.
+	const UINT8* io_base = gba->mem.io + (GBA_DISPCNT & 0xfff);
+	gba_mt_line_state_t seed;
+	memcpy(seed.io, io_base, GBA_MT_PPU_IO_SIZE);
+	for (int aff = 0; aff < 2; ++aff) {
+		seed.bgx[aff] = gba->ppu.aff[aff].render_bgx;
+		seed.bgy[aff] = gba->ppu.aff[aff].render_bgy;
+	}
+	for (int p = 0; p < 3; ++p)
+		seed.dispcnt_pipeline[p] = gba->ppu.dispcnt_pipeline[p];
+
+	// Broadcast the seed to all 160 rows, 4-at-a-time unrolled for a
+	// little ILP on the main thread.
+	INT32 y = 0;
+	for (; y + 3 < GBA_LCD_H; y += 4) {
+		s->line_state[y+0] = seed;
+		s->line_state[y+1] = seed;
+		s->line_state[y+2] = seed;
+		s->line_state[y+3] = seed;
+	}
+	for (; y < GBA_LCD_H; ++y)
+		s->line_state[y] = seed;
+}
+
+// ---- install_row ----------------------------------------------------------
+// Install a single row's line_state into the worker's scratch gba_t and
+// remember it for fallback use when a later row's snapshot is missing.
+static inline void gba_mt_install_row(gba_t* gba, const gba_mt_line_state_t* ls,
+                                       int row_y, gba_mt_line_state_t* installed_prev,
+                                       int* prev_valid_row)
+{
+	(void)row_y;
+	memcpy(gba->mem.io + (GBA_DISPCNT & 0xfff), ls->io, GBA_MT_PPU_IO_SIZE);
+	for (int aff = 0; aff < 2; ++aff) {
+		gba->ppu.aff[aff].render_bgx = ls->bgx[aff];
+		gba->ppu.aff[aff].render_bgy = ls->bgy[aff];
+		gba->ppu.aff[aff].wrote_bgx  = false;
+		gba->ppu.aff[aff].wrote_bgy  = false;
+	}
+	for (int p = 0; p < 3; ++p)
+		gba->ppu.dispcnt_pipeline[p] = ls->dispcnt_pipeline[p];
+	*installed_prev  = *ls;
+	*prev_valid_row  = row_y;
+}
+
+// ---- gba_mt_render_frame_into ---------------------------------------------
+// Worker entry point for pixel composition.  Reads *only* from snap, writes
+// *only* to out_fb.  Uses a stack-local gba_t so no main-thread state is
+// touched during rendering.
+static void gba_mt_render_frame_into(gba_mt_snapshot_t* snap, UINT32* out_fb,
+                                     UINT32* prev_fb_for_ghosting)
+{
+	gba_t gba;
+	// Zero the entire stack gba_t (~155 KB).  Runs on the worker thread
+	// (parallel with main-thread emulation) so its cost is not on the hot
+	// path.  Zeroing guarantees deterministic behaviour for any fields
+	// the render path touches that we don't explicitly initialise below,
+	// preventing UB from uninitialised stack contents.
+	memset(&gba, 0, sizeof(gba));
+
+	// Big buffers — copied by main thread at VBlank entry, BEFORE any
+	// VBlank DMA has a chance to overwrite the live buffers.
+	memcpy(gba.mem.vram,    snap->vram,    sizeof(snap->vram));
+	memcpy(gba.mem.oam,     snap->oam,     sizeof(snap->oam));
+	memcpy(gba.mem.palette, snap->palette, sizeof(snap->palette));
+	gba.ppu.ghosting_strength = snap->ghosting_strength;
+	gba.ppu.render_per_pixel  = snap->render_per_pixel;
+	gba.framebuffer           = (UINT8*)out_fb;
+
+	// Ghosting seed: copy the previous displayed frame into the output
+	// buffer so the per-pixel rasteriser can blend new pixels on top
+	// using SBF — exactly matching single-thread behaviour.
+	// We do NOT pre-attenuate here; the raster already applies SBF once.
+	// Pre-attenuating would double-apply (sbf * sbf) making ghosting
+	// weaker and darker than intended.
+	{
+		const INT32 total_bytes = GBA_LCD_W * GBA_LCD_H * 4;
+		if (snap->ghosting_strength > 0.0f && prev_fb_for_ghosting) {
+			memcpy(out_fb, prev_fb_for_ghosting, total_bytes);
+		} else {
+			memset(out_fb, 0, total_bytes);
+		}
+	}
+
+	// Backdrop initialisation: palette[0] with target type=5 so pixels
+	// with no layer coverage blend correctly through BLDCNT/BLDY.
+	{
+		UINT16 bg_pal0 = *(const UINT16*)(gba.mem.palette + GBA_BG_PALETTE);
+		UINT32 backdrop_col = ((UINT32)bg_pal0) | (5u << 17);
+
+		INT32 x = 0;
+		for (; x + 7 < GBA_LCD_W; x += 8) {
+			gba.first_target_buffer[x+0] = backdrop_col;
+			gba.first_target_buffer[x+1] = backdrop_col;
+			gba.first_target_buffer[x+2] = backdrop_col;
+			gba.first_target_buffer[x+3] = backdrop_col;
+			gba.first_target_buffer[x+4] = backdrop_col;
+			gba.first_target_buffer[x+5] = backdrop_col;
+			gba.first_target_buffer[x+6] = backdrop_col;
+			gba.first_target_buffer[x+7] = backdrop_col;
+		}
+		for (; x < GBA_LCD_W; ++x) gba.first_target_buffer[x] = backdrop_col;
+
+		x = 0;
+		for (; x + 7 < GBA_LCD_W; x += 8) {
+			gba.second_target_buffer[x+0] = backdrop_col;
+			gba.second_target_buffer[x+1] = backdrop_col;
+			gba.second_target_buffer[x+2] = backdrop_col;
+			gba.second_target_buffer[x+3] = backdrop_col;
+			gba.second_target_buffer[x+4] = backdrop_col;
+			gba.second_target_buffer[x+5] = backdrop_col;
+			gba.second_target_buffer[x+6] = backdrop_col;
+			gba.second_target_buffer[x+7] = backdrop_col;
+		}
+		for (; x < GBA_LCD_W; ++x) gba.second_target_buffer[x] = backdrop_col;
+
+		// Window mask: all 6 layers enabled by default (0x3F);
+		// render_objs / window logic will overwrite per-pixel.
+		memset(gba.window, 0x3F, sizeof(gba.window));
+	}
+
+	const bool render_per_pixel = snap->render_per_pixel;
+
+	// Last fully-installed line_state — used as fallback when a row's
+	// snapshot is missing (fast-forward edge case).  Carrying the
+	// previous valid state forward matches real hardware: MMIO/affine
+	// reference points hold their last-written value until the CPU
+	// rewrites them on a later scanline.
+	gba_mt_line_state_t installed_prev;
+	int prev_valid_row = -1;
+
+	// Install line 0 (always valid — reset_slot prefills every row).
+	gba_mt_install_row(&gba, &snap->line_state[0], 0,
+	                    &installed_prev, &prev_valid_row);
+
+	// Initialise mosaic counter at frame start (matches ST; both modes
+	// rely on it being 0 at the top of the frame).
+	gba.ppu.mosaic_y_counter = 0;
+
+	if (render_per_pixel) {
+		gba_ppu_render_objs(&gba, 0);
+	}
+
+	for (INT32 lcd_y = 0; lcd_y < GBA_LCD_H; ++lcd_y) {
+		const gba_mt_line_state_t* ls = &snap->line_state[lcd_y];
+		bool row_ok = snap->line_hb_valid[lcd_y] && snap->line_ls_valid[lcd_y];
+
+		// Per-pixel mode reinstalls every row (render_pixel reads the
+		// IO state set at the top of the iteration).  Scanline mode
+		// already has row 0 installed above; reinstall for y>=1.
+		if (lcd_y > 0 || render_per_pixel) {
+			const gba_mt_line_state_t* ls_use;
+			if (row_ok) {
+				ls_use = ls;
+			} else if (prev_valid_row >= 0) {
+				ls_use = &installed_prev;
+			} else {
+				ls_use = &snap->line_state[0];  // last-resort VBlank seed
+			}
+			gba_mt_install_row(&gba, ls_use, lcd_y,
+			                    &installed_prev, &prev_valid_row);
+		}
+
+		if (render_per_pixel) {
+			// Per-pixel: first_target_buffer already has this line's
+			// OBJs (preloaded at loop head for y=0, post-render for y>=1).
+			INT32 lcd_x = 0;
+			for (; lcd_x + 7 < GBA_LCD_W; lcd_x += 8) {
+				gba_ppu_render_pixel(&gba, lcd_x+0, lcd_y);
+				gba_ppu_render_pixel(&gba, lcd_x+1, lcd_y);
+				gba_ppu_render_pixel(&gba, lcd_x+2, lcd_y);
+				gba_ppu_render_pixel(&gba, lcd_x+3, lcd_y);
+				gba_ppu_render_pixel(&gba, lcd_x+4, lcd_y);
+				gba_ppu_render_pixel(&gba, lcd_x+5, lcd_y);
+				gba_ppu_render_pixel(&gba, lcd_x+6, lcd_y);
+				gba_ppu_render_pixel(&gba, lcd_x+7, lcd_y);
+			}
+			for (; lcd_x < GBA_LCD_W; ++lcd_x)
+				gba_ppu_render_pixel(&gba, lcd_x, lcd_y);
+
+			// Preload OBJs for the NEXT line (matches ST's y-HBlank
+			// timing).  Temporarily install next line's IO so WIN/MOSAIC
+			// registers are correct for that preload.  wrote_bgx/bgy
+			// are cleared defensively so affine state never leaks
+			// between rows.  The outer loop reinstalls the correct
+			// row state at the top of its next iteration.
+			if (lcd_y < GBA_LCD_H - 1) {
+				INT32 ny = lcd_y + 1;
+				bool next_ok = snap->line_hb_valid[ny] && snap->line_ls_valid[ny];
+				const gba_mt_line_state_t* lsnext = next_ok
+					? &snap->line_state[ny]
+					: (prev_valid_row >= 0 ? &installed_prev : &snap->line_state[0]);
+				memcpy(gba.mem.io + (GBA_DISPCNT & 0xfff),
+				       lsnext->io, GBA_MT_PPU_IO_SIZE);
+				for (int aff = 0; aff < 2; ++aff) {
+					gba.ppu.aff[aff].render_bgx = lsnext->bgx[aff];
+					gba.ppu.aff[aff].render_bgy = lsnext->bgy[aff];
+					gba.ppu.aff[aff].wrote_bgx  = false;
+					gba.ppu.aff[aff].wrote_bgy  = false;
+				}
+				for (int p = 0; p < 3; ++p)
+					gba.ppu.dispcnt_pipeline[p] = lsnext->dispcnt_pipeline[p];
+				gba_ppu_render_objs(&gba, ny);
+			}
+		} else {
+			// Scanline mode: OBJ preload + BG composition in one shot
+			// at HBlank-START timing, matching ST.
+			gba_ppu_render_objs(&gba, lcd_y);
+			gba_ppu_render_scanline(&gba, lcd_y);
+		}
+	}
+}
+
+// ---- begin_frame ----------------------------------------------------------
+static void gba_mt_begin_frame(gba_mt_t* mt, gba_t* gba, sb_emu_state_t* emu)
+{
+	if (!mt || !mt->enabled) return;
+	bool want = (emu && emu->render_frame);
+	mt->fast_forward           = !want;
+	mt->want_render_this_frame = want;
+	// Prefill the write slot with VBlank defaults only on render frames;
+	// skip frames (frame-skip / fast-forward) never render this slot.
+	if (want)
+		gba_mt_reset_slot(mt, mt->w_idx, gba);
+}
+
+// ---- HBlank MMIO snapshot -------------------------------------------------
+static void gba_mt_ppu_hblank_snapshot(gba_mt_t* mt, gba_t* gba, INT32 lcd_y)
+{
+	if (!mt || !mt->enabled) return;
+	if (lcd_y < 0 || lcd_y >= GBA_LCD_H) return;
+	// On skipped frames reset_slot already seeded every row; save the
+	// 15 KB of per-HBlank memcpy.
+	if (!mt->want_render_this_frame) return;
+
+	gba_mt_snapshot_t* snap = &mt->snapshots[mt->w_idx];
+	memcpy(snap->line_state[lcd_y].io,
+	       gba->mem.io + (GBA_DISPCNT & 0xfff), GBA_MT_PPU_IO_SIZE);
+	snap->line_hb_valid[lcd_y] = true;
+}
+
+// ---- line-start snapshot (pipeline + affine, AFTER affine update) ---------
+static void gba_mt_ppu_line_start_snapshot(gba_mt_t* mt, gba_t* gba, INT32 lcd_y)
+{
+	if (!mt || !mt->enabled) return;
+	if (lcd_y < 0 || lcd_y >= GBA_LCD_H) return;
+	if (!mt->want_render_this_frame) return;
+
+	gba_mt_snapshot_t* snap = &mt->snapshots[mt->w_idx];
+	gba_mt_line_state_t* ls = &snap->line_state[lcd_y];
+	for (int aff = 0; aff < 2; ++aff) {
+		ls->bgx[aff] = gba->ppu.aff[aff].render_bgx;
+		ls->bgy[aff] = gba->ppu.aff[aff].render_bgy;
+	}
+	for (int p = 0; p < 3; ++p)
+		ls->dispcnt_pipeline[p] = gba->ppu.dispcnt_pipeline[p];
+	snap->line_ls_valid[lcd_y] = true;
+}
+
+// ---- VBlank entry (at VBlank edge, BEFORE VBlank DMA fires) ---------------
+static void gba_mt_ppu_vblank_entry(gba_mt_t* mt, gba_t* gba)
+{
+	if (!mt || !mt->enabled) return;
+	// only render frames need the big-buffer snapshot; skip frames would
+	// copy ~130 KB the worker never renders (reset_slot recaptures on the
+	// next render frame anyway)
+	if (!mt->want_render_this_frame) return;
+
+	gba_mt_snapshot_t* snap = &mt->snapshots[mt->w_idx];
+	// On skipped frames where vram_copied is already true from a
+	// previous frame (reset_slot sets it false on first entry after
+	// publish), save the ~130 KB big-buffer memcpy — the worker isn't
+	// going to render this slot anyway.
+	if (snap->vram_copied) return;
+
+	memcpy(snap->vram,    gba->mem.vram,    sizeof(snap->vram));
+	memcpy(snap->oam,     gba->mem.oam,     sizeof(snap->oam));
+	memcpy(snap->palette, gba->mem.palette, sizeof(snap->palette));
+	snap->ghosting_strength = gba->ppu.ghosting_strength;
+	snap->render_per_pixel  = gba->ppu.render_per_pixel;
+	snap->vram_copied       = true;
+}
+
+// ===========================================================================
+// MT-aware PPU event hook
+//
+// Runs the PPU state machine bit-exact with ST: DISPSTAT / VCOUNT / IRQs /
+// pipeline shift / affine reference-point updates / DMA scheduling / MT
+// snapshot capture.
+//
+// CRITICAL: pixel composition is NOT called here.  It runs exclusively in
+// the worker via gba_mt_render_frame_into.
+// ===========================================================================
+static inline void gba_ppu_event_mt(gba_t* gba, sb_emu_state_t* emu, UINT32 cycles_late)
+{
+	bool render = emu ? emu->render_frame : true;
+
+	if (gba->ppu.scan_clock >= 280896)
+		gba->ppu.scan_clock -= 280896;
+
+	INT32 lcd_y = (INT32)(gba->ppu.scan_clock / 1232);
+	INT32 lcd_x = (INT32)((gba->ppu.scan_clock % 1232) / 4);
+	gba->ppu.scan_clock++;
+
+	INT32 fast_forward_ticks =
+		gba_ppu_compute_max_fast_forward(gba, render && gba->ppu.render_per_pixel) + 1;
+
+	// Advance scan_clock in lock-step with the global scheduler, even
+	// across large skips (HBlank interior, VBlank/not-visible region).
+	// Without this, fast-forward leaves scan_clock behind, lcd_y/lcd_x
+	// go stale, and affine / snapshot events land on the wrong rows
+	// → bottom-of-screen black blocks.
+	gba->ppu.scan_clock += fast_forward_ticks;
+
+	// Only evaluate DISPSTAT / edge events at the three column
+	// boundaries ST cares about (lcd_x == 0 / HBLANK_START / HBLANK_END).
+	// After a scan_clock jump the callback fires at an arbitrary dot;
+	// evaluating edges in between would fire IRQs / snapshots multiple
+	// times per edge.
+	const bool at_column_edge =
+		(lcd_x == 0) ||
+		(lcd_x == GBA_LCD_HBLANK_START) ||
+		(lcd_x == GBA_LCD_HBLANK_END);
+
+	bool hblank = (lcd_x >= GBA_LCD_HBLANK_START) && (lcd_x < GBA_LCD_HBLANK_END);
+	bool vblank = (lcd_y >= GBA_LCD_H) && (lcd_y < 227);
+	INT32 vcount = (lcd_y + (lcd_x >= GBA_LCD_HBLANK_END)) % 228;
+
+	UINT32 new_if = 0;
+	if (at_column_edge) {
+		UINT32 vcount_cmp = gba_io_read16(gba, GBA_DISPSTAT) >> 8;
+		UINT16 disp_stat  = (UINT16)(gba_io_read16(gba, GBA_DISPSTAT) & ~0b111);
+		if (vblank)                      disp_stat |= 1;
+		if (hblank)                      disp_stat |= 2;
+		if (vcount == (INT32)vcount_cmp) disp_stat |= 4;
+		gba_io_store16(gba, GBA_DISPSTAT, disp_stat);
+		gba_io_store16(gba, GBA_VCOUNT,  (UINT16)vcount);
+
+		bool hblank_irq_en = SB_BFE(gba_io_read16(gba, GBA_DISPSTAT), 4, 1);
+		if (hblank != gba->ppu.last_hblank) {
+			gba->ppu.last_hblank = hblank;
+			if (hblank) {
+				if (hblank_irq_en)
+					new_if |= (1 << GBA_INT_LCD_HBLANK);
+				++gba->ppu.hblank_seq;
+				gba_timing_schedule(gba, &gba->dma_event, 2);
+				if (g_gba_mt_current && g_gba_mt_current->enabled
+				    && lcd_y < GBA_LCD_H)
+					gba_mt_ppu_hblank_snapshot(g_gba_mt_current, gba, lcd_y);
+			}
+			if (!hblank) {
+				// Pipeline shift on hblank falling edge (HBLANK_END),
+				// exactly one dot before lcd_x==0.  ST reads
+				// dispcnt_pipeline[0] for the next line's affine update,
+				// so the shift must complete before lcd_x==0.
+				gba->ppu.dispcnt_pipeline[0] = gba->ppu.dispcnt_pipeline[1];
+				gba->ppu.dispcnt_pipeline[1] = gba->ppu.dispcnt_pipeline[2];
+				gba->ppu.dispcnt_pipeline[2] = gba_io_read16(gba, GBA_DISPCNT);
+			}
+		}
+
+		if (vblank != gba->ppu.last_vblank) {
+			gba->ppu.last_vblank = vblank;
+			bool vblank_irq_en   = SB_BFE(gba_io_read16(gba, GBA_DISPSTAT), 3, 1);
+			if (vblank) {
+				if (vblank_irq_en)
+					new_if |= (1 << GBA_INT_LCD_VBLANK);
+				++gba->ppu.vblank_seq;
+				gba_timing_schedule(gba, &gba->dma_event, 2);
+				gba->frame_in_progress = false;
+				if (g_gba_mt_current && g_gba_mt_current->enabled)
+					gba_mt_ppu_vblank_entry(g_gba_mt_current, gba);
+			}
+		}
+
+		bool vcount_irq_en = SB_BFE(gba_io_read16(gba, GBA_DISPSTAT), 5, 1);
+		UINT32 vcount_cmp2 = gba_io_read16(gba, GBA_DISPSTAT) >> 8;
+		if (vcount == (INT32)vcount_cmp2 && vcount_irq_en)
+			new_if |= (1 << GBA_INT_LCD_VCOUNT);
+	}
+
+	if (new_if)
+		gba_send_interrupt(gba, 3, new_if);
+
+	// Affine BG increment / reload at lcd_x == 0.
+	// Must run on both render=true and render=false frames so affine
+	// reference points don't drift during frame-skip / fast-forward.
+	// Logic is bit-exact with ST (gba_ppu_event):
+	//   - bg_mode != 0 && lcd_y != 0 guard
+	//   - per-BG mosaic enable bit (bgcnt bit 6)
+	//   - mosaic jump uses (lcd_y % mos_y) == 0
+	//   - wrote_bgx/y: if CPU wrote a new ref point this scanline, SKIP
+	//     the b/d increment (ST clears the flag and does NOT add b/d
+	//     after a write); reload overwrites below
+	if (lcd_x == 0 && lcd_y < GBA_LCD_H) {
+		UINT16 dispcnt = gba->ppu.dispcnt_pipeline[0];
+		INT32  bg_mode = SB_BFE(dispcnt, 0, 3);
+
+		if (bg_mode != 0 && lcd_y != 0) {
+			for (INT32 aff = 0; aff < 2; ++aff) {
+				bool bg_en = SB_BFE(dispcnt, 8 + aff + 2, 1);
+				if (!bg_en) continue;
+
+				INT32  pb = (INT16)gba_io_read16(gba, GBA_BG2PB + aff * 0x10);
+				INT32  pd = (INT16)gba_io_read16(gba, GBA_BG2PD + aff * 0x10);
+				UINT16 bgcnt = gba_io_read16(gba, GBA_BG2CNT + aff * 2);
+				bool mosaic = SB_BFE(bgcnt, 6, 1);
+
+				if (gba->ppu.aff[aff].wrote_bgx) {
+					// CPU wrote a new reference point: skip the per-line
+					// b/d increment; reload below overwrites render_bgx
+					// with the freshly-written value.
+					gba->ppu.aff[aff].wrote_bgx = false;
+				} else if (mosaic) {
+					UINT16 mos_reg = gba_io_read16(gba, GBA_MOSAIC);
+					INT32  mos_y   = SB_BFE(mos_reg, 4, 4) + 1;
+					if ((lcd_y % mos_y) == 0) {
+						gba->ppu.aff[aff].render_bgx += pb * mos_y;
+						gba->ppu.aff[aff].render_bgy += pd * mos_y;
+					}
+				} else {
+					gba->ppu.aff[aff].render_bgx += pb;
+					gba->ppu.aff[aff].render_bgy += pd;
+				}
+				if (gba->ppu.aff[aff].wrote_bgy)
+					gba->ppu.aff[aff].wrote_bgy = false;
+			}
+		}
+
+		// Reload from BG2X/BG2Y when written this scanline, or
+		// unconditionally on line 0.
+		for (INT32 aff = 0; aff < 2; ++aff) {
+			if (gba->ppu.aff[aff].wrote_bgx || lcd_y == 0) {
+				gba->ppu.aff[aff].render_bgx = gba_io_read32(gba, GBA_BG2X + aff * 0x10);
+				gba->ppu.aff[aff].render_bgx = SB_BFE(gba->ppu.aff[aff].render_bgx, 0, 28);
+				gba->ppu.aff[aff].render_bgx = ((INT32)(gba->ppu.aff[aff].render_bgx << 4)) >> 4;
+				gba->ppu.aff[aff].wrote_bgx  = false;
+			}
+			if (gba->ppu.aff[aff].wrote_bgy || lcd_y == 0) {
+				gba->ppu.aff[aff].render_bgy = gba_io_read32(gba, GBA_BG2Y + aff * 0x10);
+				gba->ppu.aff[aff].render_bgy = SB_BFE(gba->ppu.aff[aff].render_bgy, 0, 28);
+				gba->ppu.aff[aff].render_bgy = ((INT32)(gba->ppu.aff[aff].render_bgy << 4)) >> 4;
+				gba->ppu.aff[aff].wrote_bgy  = false;
+			}
+		}
+
+		if (g_gba_mt_current && g_gba_mt_current->enabled && lcd_y < GBA_LCD_H)
+			gba_mt_ppu_line_start_snapshot(g_gba_mt_current, gba, lcd_y);
+	}
+
+	// NOTE: gba_ppu_render_pixel / render_objs / render_scanline are NOT
+	// called here.  Pixel composition runs only in the worker.  Calling
+	// them here would double the per-frame pixel work and halve FPS.
+
+	// Reschedule next PPU event on the absolute scanline grid,
+	// compensating for dispatch lateness (matches ST gba_ppu_event).
+	gba_timing_deschedule(gba, &gba->ppu_event);
+	gba_timing_schedule(gba, &gba->ppu_event,
+	                    fast_forward_ticks + 1 - (INT32)cycles_late);
+}
+
+// ===========================================================================
+// Platform back-end primitives
+//
+// The vblank_publish flow is platform-agnostic; only these 4 primitives
+// differ between POSIX and Win32:
+//   gba_mt_plat_trywait_done()  — non-blocking poll for worker completion
+//   gba_mt_plat_wait_done()     — blocking wait for worker completion
+//   gba_mt_plat_release_job()   — post job semaphore (wake worker)
+//   gba_mt_plat_mb()            — full memory barrier (publish ordering)
+// ===========================================================================
+
+// ---- POSIX primitives -----------------------------------------------------
+#if GBA_HAVE_PTHREAD
+
+static inline bool gba_mt_plat_trywait_done(gba_mt_t* mt) {
+	// rv MUST be initialised to -1 so the EINTR loop has deterministic
+	// behaviour even if sem_trywait somehow returns without writing it.
+	int rv = -1;
+	do { rv = sem_trywait(mt->done_sem); } while (rv == -1 && errno == EINTR);
+	return (rv == 0);
+}
+
+static inline void gba_mt_plat_wait_done(gba_mt_t* mt) {
+	for (;;) { int rv = sem_wait(mt->done_sem); if (rv == 0 || errno != EINTR) break; }
+}
+
+static inline void gba_mt_plat_release_job(gba_mt_t* mt) {
+	sem_post(mt->job_sem);
+}
+
+// Full memory barrier.  __sync_synchronize is a compiler barrier on x86
+// (TSO makes a HW barrier a no-op at runtime) and emits a DMB ISH on
+// ARM/AArch64.  Works on both GCC and Clang.
+static inline void gba_mt_plat_mb(void) {
+	__sync_synchronize();
+}
+
+// ---- Win32 primitives -----------------------------------------------------
+#elif GBA_HAVE_WINTHREAD
+
+static inline bool gba_mt_plat_trywait_done(gba_mt_t* mt) {
+	return (WaitForSingleObject(mt->done_sem, 0) == WAIT_OBJECT_0);
+}
+
+static inline void gba_mt_plat_wait_done(gba_mt_t* mt) {
+	WaitForSingleObject(mt->done_sem, INFINITE);
+}
+
+static inline void gba_mt_plat_release_job(gba_mt_t* mt) {
+	ReleaseSemaphore(mt->job_sem, 1, NULL);
+}
+
+static inline void gba_mt_plat_mb(void) {
+	MemoryBarrier();
+}
+
+#endif
+
+// ===========================================================================
+// Platform-agnostic vblank publish
+//
+// 1. Wait (blocking in normal play, non-blocking poll in fast-forward)
+//    for the worker to finish the previous frame, if it was busy.
+// 2. Promote the newly-finished backbuf to front_idx.
+// 3. Copy the front frame to the presentation buffer (memset black
+//    until the very first worker frame completes).
+// 4. If rendering this frame and the worker is free and the snapshot is
+//    complete, post a new render job; otherwise just reset the write slot.
+// ===========================================================================
+static void gba_mt_ppu_vblank_publish(gba_mt_t* mt, gba_t* gba,
+                                      gba_scratch_t* scratch)
+{
+	if (!mt || !mt->enabled) {
+		gba->framebuffer = scratch->framebuffer;
+		return;
+	}
+
+	// Step 1: synchronise with the worker.
+	if (mt->worker_busy) {
+		bool finished;
+		if (mt->fast_forward) {
+			// Non-blocking poll — if worker hasn't finished, skip this
+			// vblank and keep showing the last good frame.
+			finished = gba_mt_plat_trywait_done(mt);
+		} else {
+			// Blocking wait — tight pipeline for lowest latency.
+			gba_mt_plat_wait_done(mt);
+			finished = true;
+		}
+		if (finished) {
+			mt->worker_busy = false;
+			mt->job_pending  = false;
+		}
+		// else: worker still busy → no new job this vblank.
+	}
+	if (!mt->worker_busy && mt->ready_back_idx >= 0)
+		mt->front_idx = mt->ready_back_idx;
+
+	// Step 2: present the front buffer.  The copy is ~150 KB, so only do
+	// it when the front frame actually changed; skip frames would
+	// otherwise repeat it for nothing.
+	if (mt->have_first_frame) {
+		if (mt->front_idx != mt->presented_front_idx) {
+			memcpy(scratch->framebuffer, mt->backbuf[mt->front_idx],
+			       sizeof(scratch->framebuffer));
+			mt->presented_front_idx = mt->front_idx;
+		}
+	} else if (!mt->presented_black) {
+		memset(scratch->framebuffer, 0, sizeof(scratch->framebuffer));
+		mt->presented_black = true;
+	}
+	gba->framebuffer = scratch->framebuffer;
+
+	// Step 3: post a new job if we are rendering this frame and the
+	// worker is free to accept new work.
+	if (mt->want_render_this_frame && !mt->worker_busy) {
+		int w = mt->w_idx;
+		gba_mt_snapshot_t* snap = &mt->snapshots[w];
+		if (snap->vram_copied) {
+			// vblank_publish is called only after wait_done returned
+			// (or worker was already idle), so snapshot slot w — which
+			// main thread has been filling this entire frame — is
+			// guaranteed not to be in use by the worker.  The worker
+			// will write its output into backbuf[w] (1:1 slot mapping).
+			// Publish the job.
+			mt->r_idx = w;
+			mt->w_idx = (w + 1) % GBA_MT_N_BUFFERS;
+			// All publish-visible state (r_idx, w_idx, have_first_frame,
+			// snapshot contents, front_idx) must be set BEFORE the
+			// release barrier below, so the worker sees a consistent
+			// snapshot after sem_wait(job_sem) returns.
+			mt->job_pending      = true;
+			mt->worker_busy      = true;
+			mt->have_first_frame = true;
+			// Pre-seed the new write slot with VBlank-time defaults
+			// for the next frame's capture.
+			gba_mt_reset_slot(mt, mt->w_idx, gba);
+			// Main → worker publish barrier.
+			gba_mt_plat_mb();
+			gba_mt_plat_release_job(mt);
+			mt->frame_count++;
+		} else {
+			// Snapshot not complete (should be rare — vblank_entry sets
+			// vram_copied at VBlank edge, before we get here).  Reset
+			// the slot and wait for the next vblank.
+			gba_mt_reset_slot(mt, w, gba);
+		}
+		mt->want_render_this_frame = false;
+	}
+}
+
+// ===========================================================================
+// POSIX back-end: thread creation / destruction / worker loop
+// ===========================================================================
+#if GBA_HAVE_PTHREAD
+
+static void* gba_mt_worker_thread(void* arg)
+{
+	gba_mt_t* mt = (gba_mt_t*)arg;
+	for (;;) {
+		// Wait for the next job (EINTR-safe).
+		for (;;) { int rv = sem_wait(mt->job_sem); if (rv == 0 || errno != EINTR) break; }
+		if (mt->exiting) break;
+		if (!mt->job_pending) continue;     // spurious wake-up
+
+		int ridx = mt->r_idx;
+		// Load front_idx AFTER acquiring job_sem: the main thread
+		// wrote it before releasing the semaphore, and sem_wait's
+		// acquire semantics guarantee this read sees the new value.
+		int front = mt->front_idx;
+		UINT32* ghost_src = (front >= 0 && mt->have_first_frame)
+			? (UINT32*)mt->backbuf[front] : NULL;
+
+		gba_mt_render_frame_into(&mt->snapshots[ridx],
+		                         (UINT32*)mt->backbuf[ridx], ghost_src);
+
+		// Worker → main thread publish barrier: ensure all backbuf
+		// writes are visible before we set ready_back_idx and post
+		// done_sem.
+		gba_mt_plat_mb();
+		mt->ready_back_idx = ridx;
+		mt->worker_busy    = false;
+		mt->job_pending    = false;
+		sem_post(mt->done_sem);
+	}
+	return NULL;
+}
+
+static INT32 gba_mt_init(gba_mt_t* mt)
+{
+	memset(mt, 0, sizeof(*mt));
+	mt->enabled              = false;
+	mt->exiting              = false;
+	mt->w_idx = mt->r_idx = mt->front_idx = 0;
+	mt->ready_back_idx       = -1;
+	mt->worker_busy          = false;
+	mt->job_pending          = false;
+	mt->have_first_frame     = false;
+	mt->presented_front_idx  = -1;
+	mt->presented_black      = false;
+	mt->fast_forward         = false;
+	mt->frame_count          = 0;
+	mt->want_render_this_frame = false;
+	mt->job_sem = mt->done_sem = NULL;
+
+	// Named semaphores (macOS does not support process-shared unnamed
+	// semaphores via sem_init; named ones work everywhere).  Encode the
+	// control-block pointer into the name to guarantee uniqueness across
+	// multiple concurrent GbaCore instances without needing a global
+	// atomic counter (which itself would be a thread-initialisation
+	// race on some platforms).
+	// Name format: "/fbngba{j|d}_<pointer-hex>" — max ~28 chars on
+	// 64-bit ("/fbngbaj_0x7f1234567890abcd"), well within 40-byte
+	// buffers.
+	snprintf(mt->job_sem_name,  sizeof(mt->job_sem_name),
+	         "/fbngbaj_%p", (void*)mt);
+	snprintf(mt->done_sem_name, sizeof(mt->done_sem_name),
+	         "/fbngbad_%p", (void*)mt);
+	sem_unlink(mt->job_sem_name);
+	sem_unlink(mt->done_sem_name);
+	mt->job_sem  = sem_open(mt->job_sem_name,  O_CREAT, 0644, 0);
+	mt->done_sem = sem_open(mt->done_sem_name, O_CREAT, 0644, 0);
+	sem_unlink(mt->job_sem_name);
+	sem_unlink(mt->done_sem_name);
+	// sem_open returns SEM_FAILED ((sem_t*)-1) on error, not NULL.
+	if (mt->job_sem  == SEM_FAILED) mt->job_sem  = NULL;
+	if (mt->done_sem == SEM_FAILED) mt->done_sem = NULL;
+	if (!mt->job_sem || !mt->done_sem) {
+		if (mt->job_sem)  { sem_close(mt->job_sem);  mt->job_sem  = NULL; }
+		if (mt->done_sem) { sem_close(mt->done_sem); mt->done_sem = NULL; }
+		return 1;
+	}
+
+	memset(mt->backbuf,   0, sizeof(mt->backbuf));
+	memset(mt->snapshots, 0, sizeof(mt->snapshots));
+
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	pthread_attr_setstacksize(&attr, 512 * 1024);
+	if (pthread_create(&mt->worker, &attr, gba_mt_worker_thread, mt) != 0) {
+		pthread_attr_destroy(&attr);
+		sem_close(mt->job_sem);
+		sem_close(mt->done_sem);
+		mt->job_sem = mt->done_sem = NULL;
+		return 1;
+	}
+	pthread_attr_destroy(&attr);
+#if defined(__linux__) && defined(__GLIBC__)
+	pthread_setname_np(mt->worker, "GBA-PPU");
+#endif
+	mt->enabled = true;
+	return 0;
+}
+
+static void gba_mt_exit(gba_mt_t* mt)
+{
+	if (!mt) return;
+	if (mt->enabled) {
+		mt->exiting = true;
+		// Wake the worker (it may be blocked on job_sem).  After it
+		// sees exiting==true it breaks out without touching any
+		// snapshot or backbuf.
+		sem_post(mt->job_sem);
+		pthread_join(mt->worker, NULL);
+		if (mt->job_sem)  { sem_close(mt->job_sem);  mt->job_sem  = NULL; }
+		if (mt->done_sem) { sem_close(mt->done_sem); mt->done_sem = NULL; }
+		mt->enabled = false;
+	}
+	memset(mt, 0, sizeof(*mt));
+}
+
+static void gba_mt_reset(gba_mt_t* mt)
+{
+	if (!mt || !mt->enabled) return;
+	// If a render job is in flight (reset/loadstate/ROM change), wait
+	// for the worker to finish before we nuke snapshots/backbufs.
+	if (mt->worker_busy || mt->job_pending) {
+		while (mt->worker_busy)
+			gba_mt_plat_wait_done(mt);
+		// Drain any stale completion tokens (defensive — should be
+		// at most one, but the loop handles pathological cases).
+		while (gba_mt_plat_trywait_done(mt)) {}
+		mt->worker_busy = false;
+		mt->job_pending = false;
+	}
+	memset(mt->backbuf,   0, sizeof(mt->backbuf));
+	memset(mt->snapshots, 0, sizeof(mt->snapshots));
+	mt->ready_back_idx       = -1;
+	mt->w_idx = mt->r_idx = mt->front_idx = 0;
+	mt->frame_count          = 0;
+	mt->have_first_frame     = false;
+	mt->presented_front_idx  = -1;
+	mt->presented_black      = false;
+	mt->fast_forward         = false;
+	mt->want_render_this_frame = false;
+}
+
+// ===========================================================================
+// Win32 back-end: thread creation / destruction / worker loop
+// ===========================================================================
+#elif GBA_HAVE_WINTHREAD
+
+static DWORD WINAPI gba_mt_worker_thread_win32(LPVOID arg)
+{
+	gba_mt_t* mt = (gba_mt_t*)arg;
+	for (;;) {
+		WaitForSingleObject(mt->job_sem, INFINITE);
+		if (mt->exiting) break;
+		if (!mt->job_pending) continue;
+
+		int ridx = mt->r_idx;
+		int front = mt->front_idx;
+		UINT32* ghost_src = (front >= 0 && mt->have_first_frame)
+			? (UINT32*)mt->backbuf[front] : NULL;
+
+		gba_mt_render_frame_into(&mt->snapshots[ridx],
+		                         (UINT32*)mt->backbuf[ridx], ghost_src);
+
+		gba_mt_plat_mb();
+		mt->ready_back_idx = ridx;
+		mt->worker_busy    = false;
+		mt->job_pending    = false;
+		ReleaseSemaphore(mt->done_sem, 1, NULL);
+	}
+	return 0;
+}
+
+#if defined(_MSC_VER)
+// Classic MSVC debugger thread-naming trick (no-op outside a debugger).
+// Uses __try/__except SEH, which is MSVC-specific.
+static void gba_mt_set_thread_name_win32(DWORD tid, const char* name)
+{
+	typedef struct { DWORD dwType; LPCSTR szName; DWORD dwThreadID; DWORD dwFlags; } TNI;
+	TNI info;
+	info.dwType     = 0x1000;
+	info.szName     = name;
+	info.dwThreadID = tid;
+	info.dwFlags    = 0;
+	__try {
+		RaiseException(0x406D1388, 0,
+		               sizeof(info)/sizeof(ULONG_PTR), (const ULONG_PTR*)&info);
+	} __except(EXCEPTION_EXECUTE_HANDLER) {}
+}
+#endif
+
+static INT32 gba_mt_init(gba_mt_t* mt)
+{
+	memset(mt, 0, sizeof(*mt));
+	mt->enabled              = false;
+	mt->exiting              = false;
+	mt->w_idx = mt->r_idx = mt->front_idx = 0;
+	mt->ready_back_idx       = -1;
+	mt->worker_busy          = false;
+	mt->job_pending          = false;
+	mt->have_first_frame     = false;
+	mt->presented_front_idx  = -1;
+	mt->presented_black      = false;
+	mt->fast_forward         = false;
+	mt->frame_count          = 0;
+	mt->want_render_this_frame = false;
+	mt->worker  = NULL;
+	mt->job_sem = mt->done_sem = NULL;
+
+	mt->job_sem  = CreateSemaphoreA(NULL, 0, GBA_MT_N_BUFFERS + 1, NULL);
+	mt->done_sem = CreateSemaphoreA(NULL, 0, GBA_MT_N_BUFFERS + 1, NULL);
+	if (!mt->job_sem || !mt->done_sem) {
+		if (mt->job_sem)  { CloseHandle(mt->job_sem);  mt->job_sem  = NULL; }
+		if (mt->done_sem) { CloseHandle(mt->done_sem); mt->done_sem = NULL; }
+		return 1;
+	}
+
+	memset(mt->backbuf,   0, sizeof(mt->backbuf));
+	memset(mt->snapshots, 0, sizeof(mt->snapshots));
+
+	DWORD tid = 0;
+	mt->worker = CreateThread(NULL, 512 * 1024,
+	                          gba_mt_worker_thread_win32, mt, 0, &tid);
+	if (!mt->worker) {
+		CloseHandle(mt->job_sem);
+		CloseHandle(mt->done_sem);
+		mt->job_sem = mt->done_sem = NULL;
+		return 1;
+	}
+	SetThreadPriority(mt->worker, THREAD_PRIORITY_NORMAL);
+#if defined(_MSC_VER)
+	gba_mt_set_thread_name_win32(tid, "GBA-PPU");
+#endif
+	mt->enabled = true;
+	return 0;
+}
+
+static void gba_mt_exit(gba_mt_t* mt)
+{
+	if (!mt) return;
+	if (mt->enabled) {
+		mt->exiting = true;
+		ReleaseSemaphore(mt->job_sem, 1, NULL);
+		WaitForSingleObject(mt->worker, INFINITE);
+		CloseHandle(mt->worker); mt->worker = NULL;
+		if (mt->job_sem)  { CloseHandle(mt->job_sem);  mt->job_sem  = NULL; }
+		if (mt->done_sem) { CloseHandle(mt->done_sem); mt->done_sem = NULL; }
+		mt->enabled = false;
+	}
+	memset(mt, 0, sizeof(*mt));
+}
+
+static void gba_mt_reset(gba_mt_t* mt)
+{
+	if (!mt || !mt->enabled) return;
+	if (mt->worker_busy || mt->job_pending) {
+		while (mt->worker_busy)
+			gba_mt_plat_wait_done(mt);
+		while (gba_mt_plat_trywait_done(mt)) {}
+		mt->worker_busy = false;
+		mt->job_pending = false;
+	}
+	memset(mt->backbuf,   0, sizeof(mt->backbuf));
+	memset(mt->snapshots, 0, sizeof(mt->snapshots));
+	mt->ready_back_idx       = -1;
+	mt->w_idx = mt->r_idx = mt->front_idx = 0;
+	mt->frame_count          = 0;
+	mt->have_first_frame     = false;
+	mt->presented_front_idx  = -1;
+	mt->presented_black      = false;
+	mt->fast_forward         = false;
+	mt->want_render_this_frame = false;
+}
+
+#endif // back-end selection (POSIX / Win32)
+
+// ===========================================================================
+// Single-threaded fallback stubs
+// (when GBA_DISABLE_MT is defined, or no threading support detected)
+// ===========================================================================
+#else // !GBA_MT_ENABLED
+
+// Minimal dummy control block.  `enabled` MUST be the first field so that
+// gba.cpp's `if (mt && mt->enabled)` test works identically to the MT path.
+// In ST mode enabled is always false (the core is memset to 0 at init and
+// gba_mt_init() is a no-op that never sets it to true), so the ST PPU
+// event callback is always selected.
+typedef struct {
+	bool enabled;
+	int  dummy;
+} gba_mt_t;
+
+// Real extern pointer (NOT a macro) — gba.cpp assigns to this variable
+// (`g_gba_mt_current = mt;` / `= NULL;`) at frame boundaries, so it must
+// be a proper lvalue.  gba.cpp provides the single definition
+// `gba_mt_t* g_gba_mt_current = NULL;`, which works in both modes because
+// the gba_mt_t type exists in both paths.
+extern gba_mt_t* g_gba_mt_current;
+
+// All gba_mt_* API functions are no-op inlines.  Their MT-enabled
+// counterparts are defined (non-inline) in the POSIX/Win32 back-end
+// sections above; these stubs let gba.cpp call the API unconditionally
+// without #if guards.
+static inline INT32 gba_mt_init(gba_mt_t* mt)                                 { (void)mt; return 1; }
+static inline void  gba_mt_exit(gba_mt_t* mt)                                 { (void)mt; }
+static inline void  gba_mt_reset(gba_mt_t* mt)                                { (void)mt; }
+static inline void  gba_mt_begin_frame(gba_mt_t* mt, gba_t* g, sb_emu_state_t* e)
+                                                                              { (void)mt; (void)g; (void)e; }
+static inline void  gba_mt_ppu_hblank_snapshot(gba_mt_t* mt, gba_t* g, INT32 y)
+                                                                              { (void)mt; (void)g; (void)y; }
+static inline void  gba_mt_ppu_line_start_snapshot(gba_mt_t* mt, gba_t* g, INT32 y)
+                                                                              { (void)mt; (void)g; (void)y; }
+static inline void  gba_mt_ppu_vblank_entry(gba_mt_t* mt, gba_t* g)           { (void)mt; (void)g; }
+static inline void  gba_mt_ppu_vblank_publish(gba_mt_t* mt, gba_t* g, gba_scratch_t* s)
+                                                                              { (void)mt; (void)g; (void)s; }
+static inline bool  gba_mt_enabled(const gba_mt_t* mt)                        { (void)mt; return false; }
+
+// gba_ppu_event_mt stub: even though the `if (mt && mt->enabled)` branch
+// in gba_tick() is always false in ST mode (enabled stays 0 forever),
+// C++ requires the function name to be declared at the point where its
+// address is taken.  The stub delegates straight to the original ST PPU
+// event so that if it is ever accidentally called, behaviour is correct
+// rather than undefined.
+static inline void gba_ppu_event_mt(gba_t* gba, sb_emu_state_t* emu, UINT32 cycles_late)
+{
+	gba_ppu_event(gba, emu, cycles_late);
+}
+
+#endif // GBA_MT_ENABLED
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // GBA_PPU_H

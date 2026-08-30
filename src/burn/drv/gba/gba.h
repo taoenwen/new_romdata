@@ -699,10 +699,12 @@ INT32  GbaCoreWriteRom(GbaCore *core, UINT32 offset, const UINT8 *data, UINT32 l
 INT32  GbaCoreLoadBios(GbaCore *core, const UINT8 *bios, size_t biosSize);
 void   GbaCoreSetBiosMode(GbaCore *core, INT32 forceCustomBios);
 void   GbaCoreSetRenderMode(GbaCore *core, INT32 perPixelMode);
+void   GbaCoreSetRenderFrame(GbaCore *core, INT32 renderFrame);
 INT32  GbaCoreReset(GbaCore *core);
 void   GbaCoreSetInput(GbaCore *core, const GbaInput *input);
 INT32  GbaCoreConfigureAudio(GbaCore *core, double sourceRate, INT32 outputFrames, INT32 captureAudio);
 INT32  GbaCoreRunFrame(GbaCore *core);
+INT32  GbaCoreMtEnabled(const GbaCore *core);
 UINT32 GbaCoreGetCartridgeFeatures(const GbaCore *core);
 UINT8  GbaCoreGetRumbleOutput(const GbaCore *core);
 

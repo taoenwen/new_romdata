@@ -52,7 +52,11 @@ static inline void    gba_sio_event(gba_t* gba, sb_emu_state_t* emu, UINT32 cycl
 
 void gba_cpu_trigger_breakpoint(void* data);
 void gba_ptrs_init(gba_t* gba, gba_scratch_t* scratch, UINT8* rom_data);
-void gba_tick(sb_emu_state_t* emu, gba_t* gba, gba_scratch_t* scratch);
+void gba_tick(sb_emu_state_t* emu, gba_t* gba, gba_scratch_t* scratch, gba_mt_t* mt);
+
+// active MT instance for the current frame (read by gba_ppu_event_mt)
+gba_mt_t* g_gba_mt_current = NULL;
+
 struct GbaCore {
 	gba_t state;
 	gba_scratch_t  scratch;
@@ -68,6 +72,11 @@ struct GbaCore {
 	UINT8  cartridgeBackupType;
 	double sourceRate;
 	INT32  outputFrames;
+	gba_mt_t mt;                // MT PPU worker; disabled when mt.enabled == 0
+	// dynamic rate control state: keeps the ring near the target latency
+	double driftRatio;          // current resample ratio (1.0 = nominal)
+	INT32  driftInterp;          // fractional resample position (Q16)
+	INT64  driftTrimmed;         // total samples dropped/inserted (stats)
 };
 
 struct GbaCartridgeProfile {
@@ -345,12 +354,16 @@ static UINT8 GbaDetectCartridgeBackupType(const UINT8 *rom, size_t romSize)
 	return profile ? profile->backupType : GBA_BACKUP_NONE;
 }
 
+static void GbaCoreClearPresentation(GbaCore *core);
+static void GbaCoreDrcReset(GbaCore *core);
+
 static void GbaCoreClearPresentation(GbaCore *core)
 {
 	if (core == NULL)
 		return;
 	core->host.audio_ring_buff.read_ptr  = 0;
 	core->host.audio_ring_buff.write_ptr = 0;
+	GbaCoreDrcReset(core);
 }
 
 static void GbaCoreApplyCartridgeFeatures(GbaCore *core)
@@ -400,13 +413,22 @@ INT32 GbaCoreInit(GbaCore **core)
 	memset(*core, 0, sizeof(GbaCore));
 	(*core)->host.render_frame  = true;
 	(*core)->host.capture_audio = true;
+	// start the MT PPU worker; falls back to single-thread on failure
+	gba_mt_init(&(*core)->mt);
 	return 0;
+}
+
+INT32 GbaCoreMtEnabled(const GbaCore *core)
+{
+	return core == NULL ? 0 : (core->mt.enabled ? 1 : 0);
 }
 
 void GbaCoreExit(GbaCore **core)
 {
 	if (core == NULL || *core == NULL)
 		return;
+	// shut down the worker before freeing core state
+	gba_mt_exit(&(*core)->mt);
 	gba_unload(&(*core)->state, &(*core)->scratch);
 	if ((*core)->ownsRom)
 		BurnFree((*core)->rom);
@@ -455,6 +477,8 @@ INT32 GbaCoreLoadRom(GbaCore *core, const UINT8 *rom, size_t romSize, const GbaR
 	gba_rtc_cold_init(&core->state.rtc, rtcSeed ? &seed : NULL);
 	GbaCoreApplyCartridgeFeatures(core);
 	GbaCoreRebind(core);
+	// drop MT snapshots from a previously-loaded ROM
+	gba_mt_reset(&core->mt);
 	GbaCoreClearPresentation(core);
 	return 0;
 }
@@ -493,6 +517,13 @@ void GbaCoreSetRenderMode(GbaCore *core, INT32 perPixelMode)
 	core->state.ppu.render_per_pixel = core->perPixelRender;
 }
 
+void GbaCoreSetRenderFrame(GbaCore *core, INT32 renderFrame)
+{
+	if (core == NULL)
+		return;
+	core->host.render_frame = renderFrame != 0;
+}
+
 INT32 GbaCoreReset(GbaCore *core)
 {
 	if (core == NULL || core->rom == NULL)
@@ -516,11 +547,15 @@ INT32 GbaCoreReset(GbaCore *core)
 	core->state.rtc.host_seconds = rtcHostSeconds;
 	core->state.rtc.status       = rtcStatus;
 	core->state.ppu.render_per_pixel = core->perPixelRender;
+	// ensure the first post-reset frame renders
+	core->host.render_frame = true;
 	gba_rtc_transport_reset(&core->state.rtc);
 	core->state.rtc.last_pins    = 0;
 	GbaCoreApplyCartridgeFeatures(core);
 	GbaCoreRebind(core);
 	GbaCoreClearAudio(core);
+	// flush MT snapshots and in-flight render jobs
+	gba_mt_reset(&core->mt);
 	return 0;
 }
 
@@ -552,8 +587,10 @@ INT32 GbaCoreRunFrame(GbaCore *core)
 {
 	if (core == NULL || core->rom == NULL)
 		return 1;
-	core->host.render_frame = true;
-	gba_tick(&core->host, &core->state, &core->scratch);
+	// render_frame is caller-controlled per frame via GbaCoreSetRenderFrame;
+	// defaults to true after init/reset/load-state
+	gba_mt_begin_frame(&core->mt, &core->state, &core->host);
+	gba_tick(&core->host, &core->state, &core->scratch, &core->mt);
 	return 0;
 }
 
@@ -584,6 +621,35 @@ static INT32 GbaCoreSourceFramesAvailable(GbaCore *core)
 	return (INT32)(sb_ring_buffer_size(&core->host.audio_ring_buff) / 2);
 }
 
+// ---- dynamic rate control ----------------------------------------------
+// The core's sample rate (frames * 59.7275Hz) and the sound card crystal
+// drift apart by a tiny fraction; over hours this accumulates into audible
+// A/V desync.  Feedback loop: measure ring latency each frame and apply a
+// sub-permille resample ratio so long-term drift is trimmed to zero.
+// Ratio is clamped to +-0.2% (inaudible); a hard latency runaway (reset,
+// load-state, pause) is corrected by directly advancing the read pointer.
+#define GBA_DRC_TARGET_FRAMES   736     // ~1 frame of buffered samples
+#define GBA_DRC_MAX_FRAMES      (736 * 8) // runaway threshold
+#define GBA_DRC_MAX_RATIO       0.002  // +-0.2%
+
+static double GbaCoreDrcUpdate(GbaCore *core, INT32 available)
+{
+	// proportional controller: error in frames -> ratio offset
+	INT32 error = GBA_DRC_TARGET_FRAMES - available;
+	double adj = (double)error / 65536.0;
+	if (adj >  GBA_DRC_MAX_RATIO) adj =  GBA_DRC_MAX_RATIO;
+	if (adj < -GBA_DRC_MAX_RATIO) adj = -GBA_DRC_MAX_RATIO;
+	// slow the loop: emu fills the ring every frame, full P would oscillate
+	core->driftRatio = 1.0 + adj;
+	return core->driftRatio;
+}
+
+static void GbaCoreDrcReset(GbaCore *core)
+{
+	core->driftRatio  = 1.0;
+	core->driftInterp = 0;
+}
+
 INT32 GbaCoreRenderAudio(GbaCore *core, INT16 *stereo, INT32 frames)
 {
 	if (core == NULL || frames <= 0)
@@ -596,21 +662,61 @@ INT32 GbaCoreRenderAudio(GbaCore *core, INT16 *stereo, INT32 frames)
 
 	sb_ring_buffer_t *ring = &core->host.audio_ring_buff;
 	INT32 available = GbaCoreSourceFramesAvailable(core);
-	INT32 produced  = available < frames ? available : frames;
-	for (INT32 i = 0; i < produced; i++) {
-		UINT32 left  = ring->read_ptr++ % SB_AUDIO_RING_BUFFER_SIZE;
-		UINT32 right = ring->read_ptr++ % SB_AUDIO_RING_BUFFER_SIZE;
+
+	// runaway latency (reset/state-load/pause leftovers): hard resync
+	if (available > GBA_DRC_MAX_FRAMES) {
+		INT32 drop = available - GBA_DRC_TARGET_FRAMES;
+		ring->read_ptr += (UINT32)drop * 2;
+		core->driftTrimmed += drop;
+		available = GbaCoreSourceFramesAvailable(core);
+	}
+
+	double ratio = GbaCoreDrcUpdate(core, available);
+
+	// resample: ratio > 1 consumes the ring faster (draining latency),
+	// ratio < 1 slower (building it up).  Linear interpolation, Q16 stepping.
+	INT32 produced = 0;
+	INT32 step = (INT32)(ratio * 65536.0);
+	INT32 interp = core->driftInterp;
+	INT32 last_l = 0, last_r = 0;
+	if (available > 0) {
+		// prime the interpolator with the first sample
+		UINT32 idx0 = ring->read_ptr % SB_AUDIO_RING_BUFFER_SIZE;
+		last_l = ring->data[idx0];
+		last_r = ring->data[(idx0 + 1) % SB_AUDIO_RING_BUFFER_SIZE];
+	}
+	while (produced < frames && available > 1) {
+		UINT32 idx1 = (ring->read_ptr + 2) % SB_AUDIO_RING_BUFFER_SIZE;
+		INT32 next_l = ring->data[idx1];
+		INT32 next_r = ring->data[(idx1 + 1) % SB_AUDIO_RING_BUFFER_SIZE];
 		if (stereo != NULL) {
-			stereo[i * 2 + 0] = ring->data[left];
-			stereo[i * 2 + 1] = ring->data[right];
+			INT32 t = interp >> 16;
+			stereo[produced * 2 + 0] = (INT16)(last_l + ((next_l - last_l) * t >> 16));
+			stereo[produced * 2 + 1] = (INT16)(last_r + ((next_r - last_r) * t >> 16));
+		}
+		++produced;
+		interp += step;
+		INT32 advance = interp >> 16;
+		if (advance > 0) {
+			ring->read_ptr += (UINT32)advance * 2;
+			available -= advance;
+			if (available < 0)
+				available = 0;
+			// reload the interpolation window
+			UINT32 nidx = ring->read_ptr % SB_AUDIO_RING_BUFFER_SIZE;
+			last_l = ring->data[nidx];
+			last_r = ring->data[(nidx + 1) % SB_AUDIO_RING_BUFFER_SIZE];
+			interp -= advance << 16;
 		}
 	}
+	core->driftInterp = interp;
+
 	if (produced < frames) {
+		// ring underrun (frame-skip / ffwd): pad silence without touching
+		// the write pointer so the DRC can rebuild latency naturally
 		INT32 missing = frames - produced;
 		if (stereo != NULL)
 			memset(stereo + produced * 2, 0, missing * 2 * sizeof(INT16));
-		ring->read_ptr  += (UINT32)missing * 2;
-		ring->write_ptr += (UINT32)missing * 2;
 	}
 	return frames;
 }
@@ -726,11 +832,18 @@ INT32 GbaCoreLoadState(GbaCore *core, const void *data, size_t size, INT32 prese
 	memcpy(&core->state, data, sizeof(gba_t));
 	memcpy(core->state.mem.cart_backup, battery, sizeof(battery));
 	core->state.ppu.render_per_pixel = core->perPixelRender;
+	// ensure the first post-load frame renders
+	core->host.render_frame = true;
 	gba_timing_rebind(&core->state);
 	GbaCoreApplyCartridgeFeatures(core);
 	GbaCoreRebind(core);
-	if (!preserveAudio)
+	// discard MT snapshots from the previous state; run-ahead playback
+	// (preserveAudio) reloads every frame and must NOT flush the worker,
+	// otherwise rendering would be starved permanently
+	if (!preserveAudio) {
+		gba_mt_reset(&core->mt);
 		GbaCoreClearAudio(core);
+	}
 	return 0;
 }
 
@@ -911,11 +1024,22 @@ void gba_ptrs_init(gba_t* gba, gba_scratch_t* scratch, UINT8* rom_data)
 	gba->cpu.user_data  = gba;
 }
 
-void gba_tick(sb_emu_state_t* emu, gba_t* gba, gba_scratch_t* scratch)
+void gba_tick(sb_emu_state_t* emu, gba_t* gba, gba_scratch_t* scratch, gba_mt_t* mt)
 {
 	gba_ptrs_init(gba, scratch, emu->rom_data);
 	gba->cpu.user_data          = gba;
 	gba->cpu.trigger_breakpoint = gba_cpu_trigger_breakpoint;
+
+	// pick the PPU event callback per frame so enable/disable takes effect
+	// immediately; gba_ppu_event_mt captures snapshots and defers pixel
+	// composition to the worker thread
+	if (mt && mt->enabled) {
+		g_gba_mt_current = mt;
+		gba->ppu_event.callback = gba_ppu_event_mt;
+	} else {
+		g_gba_mt_current = NULL;
+		gba->ppu_event.callback = gba_ppu_event;
+	}
 
 
 	gba_tick_keypad(&emu->joy, gba);
@@ -961,6 +1085,12 @@ void gba_tick(sb_emu_state_t* emu, gba_t* gba, gba_scratch_t* scratch)
 		}
 		gba_advance(gba, emu, ticks);
 	}
+	// frame boundary: publish the worker's finished frame to the presentation
+	// buffer and hand the next snapshot to the worker
+	if (mt && mt->enabled)
+		gba_mt_ppu_vblank_publish(mt, gba, scratch);
+	else
+		gba->framebuffer = scratch->framebuffer;
 	gba_gpio_update_rumble(gba);
 	emu->joy.rumble = gba->cart.gpio.rumble;
 	//LCD turns off in stop mode
@@ -970,5 +1100,7 @@ void gba_tick(sb_emu_state_t* emu, gba_t* gba, gba_scratch_t* scratch)
 		emu->run_mode          = SB_MODE_PAUSE;
 		gba->pause_after_frame = false;
 	}
+	// clear the MT pointer for code running outside this frame
+	g_gba_mt_current = NULL;
 }
 
